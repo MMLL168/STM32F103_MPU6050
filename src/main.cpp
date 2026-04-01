@@ -162,6 +162,11 @@ namespace PWM {
     Servo rudder;
     Servo aux;
     bool ready = false;
+    uint16_t lastAileronUs = Config::kServoMidUs;
+    uint16_t lastElevatorUs = Config::kServoMidUs;
+    uint16_t lastThrottleUs = Config::kServoMinUs;
+    uint16_t lastRudderUs = Config::kServoMidUs;
+    uint16_t lastAuxUs = Config::kServoMidUs;
 
     uint16_t clampMicros(uint16_t pulseUs) {
         return constrain(pulseUs, Config::kServoMinUs, Config::kServoMaxUs);
@@ -183,6 +188,11 @@ namespace PWM {
         throttle.writeMicroseconds(Config::kServoMinUs);
         rudder.writeMicroseconds(Config::kServoMidUs);
         aux.writeMicroseconds(Config::kServoMidUs);
+        lastAileronUs = Config::kServoMidUs;
+        lastElevatorUs = Config::kServoMidUs;
+        lastThrottleUs = Config::kServoMinUs;
+        lastRudderUs = Config::kServoMidUs;
+        lastAuxUs = Config::kServoMidUs;
         ready = true;
     }
 
@@ -191,11 +201,48 @@ namespace PWM {
             return;
         }
 
-        aileron.writeMicroseconds(percentToMicros(ailerons));
-        elevator.writeMicroseconds(percentToMicros(elevatorValue));
-        throttle.writeMicroseconds(percentToMicros(throttleValue));
-        rudder.writeMicroseconds(percentToMicros(rudderValue));
-        aux.writeMicroseconds(percentToMicros(auxValue));
+        lastAileronUs = percentToMicros(ailerons);
+        lastElevatorUs = percentToMicros(elevatorValue);
+        lastThrottleUs = percentToMicros(throttleValue);
+        lastRudderUs = percentToMicros(rudderValue);
+        lastAuxUs = percentToMicros(auxValue);
+
+        aileron.writeMicroseconds(lastAileronUs);
+        elevator.writeMicroseconds(lastElevatorUs);
+        throttle.writeMicroseconds(lastThrottleUs);
+        rudder.writeMicroseconds(lastRudderUs);
+        aux.writeMicroseconds(lastAuxUs);
+    }
+}
+
+namespace ManualControl {
+    bool enabled = false;
+    int masterThrottlePercent = 0;
+    int motorPercents[4] = {0, 0, 0, 0};
+
+    void setEnabled(bool value) {
+        enabled = value;
+        if (!enabled) {
+            masterThrottlePercent = 0;
+            for (int &motorPercent : motorPercents) {
+                motorPercent = 0;
+            }
+        }
+    }
+
+    void setAllMotorsPercent(int percent) {
+        masterThrottlePercent = constrain(percent, 0, 100);
+        for (int &motorPercent : motorPercents) {
+            motorPercent = masterThrottlePercent;
+        }
+    }
+
+    void setMotorPercent(size_t motorIndex, int percent) {
+        if (motorIndex >= 4) {
+            return;
+        }
+
+        motorPercents[motorIndex] = constrain(percent, 0, 100);
     }
 }
 
@@ -565,7 +612,7 @@ namespace GYRO {
     }
 
     void printPlotterHeader() {
-        Debug::logf("PLOTTER fields: ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,roll_deg,pitch_deg,yaw_deg,rc1,rc2,rc3,rc4,rc5,pid_roll_out,pid_pitch_out,pid_yaw_out\r\n");
+        Debug::logf("PLOTTER fields: ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,roll_deg,pitch_deg,yaw_deg,rc1,rc2,rc3,rc4,rc5,pid_roll_out,pid_pitch_out,pid_yaw_out,aileron_us,elevator_us,throttle_us,rudder_us\r\n");
     }
 
     bool isReadyForTelemetry() {
@@ -813,6 +860,16 @@ namespace PID {
     }
 
     void applyControlOutputs() {
+        if (ManualControl::enabled) {
+            PWM::setAllPositions(
+                ManualControl::motorPercents[0],
+                ManualControl::motorPercents[1],
+                ManualControl::motorPercents[2],
+                ManualControl::motorPercents[3],
+                50);
+            return;
+        }
+
         const int aileronPercent = constrain(static_cast<int>(50.0f + roll.output), 0, 100);
         const int elevatorPercent = constrain(static_cast<int>(50.0f + pitch.output), 0, 100);
         const int throttlePercent = constrain(ELRS::throttlePercent, 0, 100);
@@ -891,13 +948,21 @@ namespace PID {
         Debug::csvFloat(pitch.output, 2);
         Debug::comma();
         Debug::csvFloat(yaw.output, 2);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(PWM::lastAileronUs), 0);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(PWM::lastElevatorUs), 0);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(PWM::lastThrottleUs), 0);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(PWM::lastRudderUs), 0);
         Debug::endLine();
         nextPrintTimeMs = now + Config::kPidPrintIntervalMs;
     }
 }
 
 namespace Command {
-    char lineBuffer[32] = {};
+    char lineBuffer[48] = {};
     size_t lineLength = 0;
 
     void handleLine(const char *line) {
@@ -919,6 +984,37 @@ namespace Command {
 
         if (strcmp(line, "PING") == 0) {
             Debug::logf("CMD PONG\r\n");
+            return;
+        }
+
+        if (strcmp(line, "MODE AUTO") == 0) {
+            ManualControl::setEnabled(false);
+            Debug::logf("CMD MODE AUTO OK\r\n");
+            return;
+        }
+
+        if (strcmp(line, "MODE MANUAL") == 0) {
+            ManualControl::setEnabled(true);
+            ManualControl::setAllMotorsPercent(0);
+            Debug::logf("CMD MODE MANUAL OK\r\n");
+            return;
+        }
+
+        int throttlePercent = 0;
+        if (sscanf(line, "THROTTLE %d", &throttlePercent) == 1) {
+            ManualControl::setAllMotorsPercent(throttlePercent);
+            Debug::logf("CMD THROTTLE %d OK\r\n", ManualControl::masterThrottlePercent);
+            return;
+        }
+
+        int motorIndex = 0;
+        if (sscanf(line, "MOTOR%d %d", &motorIndex, &throttlePercent) == 2) {
+            if (motorIndex >= 1 && motorIndex <= 4) {
+                ManualControl::setMotorPercent(static_cast<size_t>(motorIndex - 1), throttlePercent);
+                Debug::logf("CMD MOTOR%d %d OK\r\n", motorIndex, ManualControl::motorPercents[motorIndex - 1]);
+            } else {
+                Debug::logf("CMD MOTOR INDEX INVALID:%d\r\n", motorIndex);
+            }
             return;
         }
 

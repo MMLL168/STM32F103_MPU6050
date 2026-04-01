@@ -31,6 +31,10 @@ CSV_FIELD_NAMES = [
     "pid_roll_out",
     "pid_pitch_out",
     "pid_yaw_out",
+    "aileron_us",
+    "elevator_us",
+    "throttle_us",
+    "rudder_us",
 ]
 
 
@@ -53,6 +57,10 @@ class TelemetryState:
     pid_roll_out: float = 0.0
     pid_pitch_out: float = 0.0
     pid_yaw_out: float = 0.0
+    aileron_us: float = 0.0
+    elevator_us: float = 0.0
+    throttle_us: float = 0.0
+    rudder_us: float = 0.0
     status_lines: list[str] = field(default_factory=list)
     last_update_monotonic: float = 0.0
 
@@ -203,11 +211,54 @@ class HorizonWidget(tk.Canvas):
         )
 
 
+class StickWidget(tk.Canvas):
+    def __init__(self, master, title: str, x_label: str, y_label: str, throttle_mode: bool = False):
+        super().__init__(master, width=220, height=260, bg="#0f172a", highlightthickness=0)
+        self.title = title
+        self.x_label = x_label
+        self.y_label = y_label
+        self.throttle_mode = throttle_mode
+
+    def redraw(self, x_percent: float, y_percent: float) -> None:
+        self.delete("all")
+
+        width = max(self.winfo_width(), 220)
+        height = max(self.winfo_height(), 260)
+        pad_x = 22
+        pad_top = 32
+        pad_bottom = 18
+        box_left = pad_x
+        box_top = pad_top
+        box_right = width - pad_x
+        box_bottom = height - pad_bottom
+
+        self.create_text(width / 2, 16, text=self.title, fill="#f8fafc", font=("Consolas", 11, "bold"))
+        self.create_rectangle(box_left, box_top, box_right, box_bottom, outline="#94a3b8", width=2)
+
+        center_x = (box_left + box_right) / 2
+        center_y = (box_top + box_bottom) / 2
+        self.create_line(center_x, box_top, center_x, box_bottom, fill="#334155", dash=(4, 4))
+        self.create_line(box_left, center_y, box_right, center_y, fill="#334155", dash=(4, 4))
+
+        if self.throttle_mode:
+            normalized_y = max(0.0, min(1.0, y_percent / 100.0))
+            knob_y = box_bottom - normalized_y * (box_bottom - box_top)
+        else:
+            normalized_y = max(-1.0, min(1.0, (y_percent - 50.0) / 50.0))
+            knob_y = center_y - normalized_y * ((box_bottom - box_top) / 2)
+
+        normalized_x = max(-1.0, min(1.0, (x_percent - 50.0) / 50.0))
+        knob_x = center_x + normalized_x * ((box_right - box_left) / 2)
+
+        self.create_oval(knob_x - 18, knob_y - 18, knob_x + 18, knob_y + 18, fill="#38bdf8", outline="#e2e8f0", width=2)
+        self.create_text(center_x, box_bottom + 10, text=f"{self.x_label}: {x_percent:5.1f}%   {self.y_label}: {y_percent:5.1f}%", fill="#cbd5e1", font=("Consolas", 10))
+
+
 class TelemetryApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Flight Controller Telemetry")
-        self.root.geometry("1220x800")
+        self.root.geometry("1380x860")
         self.root.configure(bg="#111827")
 
         self.telemetry = TelemetryState()
@@ -221,17 +272,42 @@ class TelemetryApp:
         self.connection_var = tk.StringVar(value="尚未連線")
         self.last_update_var = tk.StringVar(value="等待 IMU/遙測資料")
         self.csv_path_var = tk.StringVar(value="未啟用 CSV 記錄")
+        self.control_mode_var = tk.StringVar(value="auto")
+        self.manual_throttle_var = tk.IntVar(value=0)
+        self.manual_motor_vars = [tk.IntVar(value=0) for _ in range(4)]
+        self.manual_slider_updating = False
 
         self.value_vars: dict[str, tk.StringVar] = {name: tk.StringVar(value="--") for name in CSV_FIELD_NAMES}
 
         self._build_layout()
         self.refresh_ports()
+        self.update_manual_controls()
+        self.update_manual_throttle_label()
         self.reset_telemetry_view()
+        self.root.bind("<Configure>", self.on_root_resize)
         self.root.after(50, self.process_queue)
         self.root.after(500, self.update_freshness)
 
     def _build_layout(self) -> None:
-        top_bar = ttk.Frame(self.root, padding=10)
+        outer = ttk.Frame(self.root)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+
+        self.scroll_canvas = tk.Canvas(outer, bg="#111827", highlightthickness=0)
+        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        self.v_scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.scroll_canvas.yview)
+        self.v_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.h_scrollbar = ttk.Scrollbar(outer, orient=tk.HORIZONTAL, command=self.scroll_canvas.xview)
+        self.h_scrollbar.grid(row=1, column=0, sticky="ew")
+        self.scroll_canvas.configure(yscrollcommand=self.v_scrollbar.set, xscrollcommand=self.h_scrollbar.set)
+
+        self.main_frame = ttk.Frame(self.scroll_canvas, padding=0)
+        self.main_frame_window = self.scroll_canvas.create_window((0, 0), window=self.main_frame, anchor="nw")
+        self.main_frame.bind("<Configure>", self.on_main_frame_configure)
+        self.scroll_canvas.bind("<Configure>", self.on_canvas_configure)
+
+        top_bar = ttk.Frame(self.main_frame, padding=10)
         top_bar.pack(fill=tk.X)
 
         ttk.Button(top_bar, text="重新整理埠", command=self.refresh_ports).pack(side=tk.LEFT)
@@ -248,15 +324,18 @@ class TelemetryApp:
         ttk.Label(top_bar, textvariable=self.connection_var).pack(side=tk.LEFT, padx=12)
         ttk.Label(top_bar, textvariable=self.last_update_var).pack(side=tk.RIGHT)
 
-        csv_bar = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        csv_bar = ttk.Frame(self.main_frame, padding=(10, 0, 10, 10))
         csv_bar.pack(fill=tk.X)
         ttk.Label(csv_bar, text="CSV:").pack(side=tk.LEFT)
         ttk.Label(csv_bar, textvariable=self.csv_path_var).pack(side=tk.LEFT, padx=8)
+        ttk.Label(csv_bar, text="模式:").pack(side=tk.LEFT, padx=(20, 4))
+        ttk.Radiobutton(csv_bar, text="自動", value="auto", variable=self.control_mode_var, command=self.on_control_mode_changed).pack(side=tk.LEFT)
+        ttk.Radiobutton(csv_bar, text="手動", value="manual", variable=self.control_mode_var, command=self.on_control_mode_changed).pack(side=tk.LEFT, padx=(4, 0))
 
-        content = ttk.Frame(self.root, padding=10)
+        content = ttk.Frame(self.main_frame, padding=10)
         content.pack(fill=tk.BOTH, expand=True)
         content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=2)
+        content.columnconfigure(1, weight=3)
         content.rowconfigure(0, weight=1)
 
         left = ttk.Frame(content)
@@ -274,14 +353,126 @@ class TelemetryApp:
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
         right.columnconfigure(1, weight=1)
+        right.columnconfigure(2, weight=1)
+        right.rowconfigure(0, weight=3)
+        right.rowconfigure(1, weight=4)
+        right.rowconfigure(2, weight=2)
 
-        self._add_group(right, "IMU", ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "roll_deg", "pitch_deg", "yaw_deg"], 0, 0)
-        self._add_group(right, "RC", ["rc1", "rc2", "rc3", "rc4", "rc5"], 0, 1)
-        self._add_group(right, "PID", ["pid_roll_out", "pid_pitch_out", "pid_yaw_out"], 1, 0)
+        radio = ttk.LabelFrame(right, text="遙控器控制面板", padding=10)
+        radio.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
+        radio.columnconfigure(0, weight=1)
+        radio.columnconfigure(1, weight=1)
+        radio.rowconfigure(1, weight=1)
+        ttk.Label(
+            radio,
+            text="對應關係: aileron=橫滾  elevator=俯仰  throttle=總油門  rudder=偏航",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-    def _add_group(self, master, title: str, fields: list[str], row: int, column: int) -> None:
+        self.left_stick = StickWidget(radio, "左搖桿", "Yaw", "Throttle", throttle_mode=True)
+        self.left_stick.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        self.right_stick = StickWidget(radio, "右搖桿", "Roll", "Pitch")
+        self.right_stick.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+
+        self.manual_frame = ttk.LabelFrame(right, text="四馬達手動油門 Debug", padding=10)
+        self.manual_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        self.manual_frame.columnconfigure(0, weight=1)
+        self.manual_mode_label = ttk.Label(self.manual_frame, text="AUTO")
+        self.manual_mode_label.pack(pady=(0, 8))
+        self.manual_sliders_frame = ttk.Frame(self.manual_frame)
+        self.manual_sliders_frame.pack(fill=tk.BOTH, expand=True)
+        for column in range(5):
+            self.manual_sliders_frame.columnconfigure(column, weight=1)
+
+        common_frame = ttk.Frame(self.manual_sliders_frame)
+        common_frame.grid(row=0, column=0, padx=(0, 6), sticky="n")
+        ttk.Label(common_frame, text="共同").pack()
+        self.manual_throttle_scale = tk.Scale(
+            common_frame,
+            from_=100,
+            to=0,
+            orient=tk.VERTICAL,
+            length=220,
+            width=24,
+            sliderlength=28,
+            resolution=1,
+            variable=self.manual_throttle_var,
+            command=self.on_manual_throttle_changed,
+            state=tk.DISABLED,
+            showvalue=False,
+            bg="#dbe4f0",
+            fg="#0f172a",
+            troughcolor="#1e293b",
+            activebackground="#38bdf8",
+            highlightbackground="#94a3b8",
+            highlightcolor="#38bdf8",
+            highlightthickness=1,
+            bd=2,
+            relief=tk.RAISED,
+            sliderrelief=tk.RAISED,
+        )
+        self.manual_throttle_scale.pack()
+        self.manual_throttle_value_label = ttk.Label(common_frame, text="0%\n1000us", justify=tk.CENTER)
+        self.manual_throttle_value_label.pack(pady=(4, 0))
+
+        self.manual_motor_scales: list[tk.Scale] = []
+        self.manual_motor_value_labels: list[ttk.Label] = []
+        for index in range(4):
+            motor_frame = ttk.Frame(self.manual_sliders_frame)
+            motor_frame.grid(row=0, column=index + 1, padx=6, sticky="n")
+            ttk.Label(motor_frame, text=f"M{index + 1}").pack()
+            scale = tk.Scale(
+                motor_frame,
+                from_=100,
+                to=0,
+                orient=tk.VERTICAL,
+                length=220,
+                width=24,
+                sliderlength=28,
+                resolution=1,
+                variable=self.manual_motor_vars[index],
+                command=lambda _value, motor_index=index: self.on_manual_motor_changed(motor_index),
+                state=tk.DISABLED,
+                showvalue=False,
+                bg="#dbe4f0",
+                fg="#0f172a",
+                troughcolor="#1e293b",
+                activebackground="#38bdf8",
+                highlightbackground="#94a3b8",
+                highlightcolor="#38bdf8",
+                highlightthickness=1,
+                bd=2,
+                relief=tk.RAISED,
+                sliderrelief=tk.RAISED,
+            )
+            scale.pack()
+            self.manual_motor_scales.append(scale)
+            label = ttk.Label(motor_frame, text="0%\n1000us", justify=tk.CENTER)
+            label.pack(pady=(4, 0))
+            self.manual_motor_value_labels.append(label)
+        self.manual_hint_label = ttk.Label(self.manual_frame, text="共同滑桿會同步設定 PA0/PA1/PA2/PA3；你也可以再用 M1~M4 個別微調每一路。", wraplength=300, justify=tk.LEFT)
+        self.manual_hint_label.pack(pady=(8, 0), anchor="w")
+
+        self._add_group(
+            right,
+            "IMU",
+            ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "roll_deg", "pitch_deg", "yaw_deg"],
+            1,
+            1,
+        )
+        self._add_group(right, "PID", ["pid_roll_out", "pid_pitch_out", "pid_yaw_out"], 1, 2)
+        self._add_group(
+            right,
+            "輸出 PWM",
+            ["aileron_us", "elevator_us", "throttle_us", "rudder_us"],
+            2,
+            0,
+            columnspan=2,
+        )
+        self._add_group(right, "RC 原始輸入", ["rc1", "rc2", "rc3", "rc4", "rc5"], 2, 2)
+
+    def _add_group(self, master, title: str, fields: list[str], row: int, column: int, columnspan: int = 1) -> None:
         frame = ttk.LabelFrame(master, text=title, padding=10)
-        frame.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
+        frame.grid(row=row, column=column, columnspan=columnspan, sticky="nsew", padx=5, pady=5)
         for idx, field_name in enumerate(fields):
             ttk.Label(frame, text=field_name).grid(row=idx, column=0, sticky="w")
             ttk.Label(frame, textvariable=self.value_vars[field_name], font=("Consolas", 11)).grid(row=idx, column=1, sticky="e", padx=(12, 0))
@@ -291,6 +482,15 @@ class TelemetryApp:
         for name in CSV_FIELD_NAMES:
             self.value_vars[name].set("--")
         self.horizon.redraw(0.0, 0.0, 0.0)
+        self.left_stick.redraw(50.0, 0.0)
+        self.right_stick.redraw(50.0, 50.0)
+        self.manual_slider_updating = True
+        self.manual_throttle_var.set(0)
+        for motor_var in self.manual_motor_vars:
+            motor_var.set(0)
+        self.manual_slider_updating = False
+        self.update_manual_throttle_label()
+        self.update_responsive_layout()
 
     def refresh_ports(self) -> None:
         ports = [port.device for port in list_ports.comports()]
@@ -322,6 +522,8 @@ class TelemetryApp:
             self.reader = None
         self.connection_var.set("尚未連線")
         self.last_update_var.set("等待 IMU/遙測資料")
+        self.control_mode_var.set("auto")
+        self.update_manual_controls()
         self.reset_telemetry_view()
 
     def send_command(self, command: str, description: str) -> None:
@@ -337,6 +539,66 @@ class TelemetryApp:
 
     def reset_yaw(self) -> None:
         self.send_command("RESET_YAW", "重置 Yaw")
+
+    def on_control_mode_changed(self) -> None:
+        mode = self.control_mode_var.get()
+        self.update_manual_controls()
+        if mode == "manual":
+            self.send_command("MODE MANUAL", "切換手動模式")
+            self.send_manual_throttle_command()
+        else:
+            self.manual_slider_updating = True
+            self.manual_throttle_var.set(0)
+            for motor_var in self.manual_motor_vars:
+                motor_var.set(0)
+            self.manual_slider_updating = False
+            self.update_manual_throttle_label()
+            self.send_command("MODE AUTO", "切換自動模式")
+
+    def update_manual_controls(self) -> None:
+        manual_enabled = (self.control_mode_var.get() == "manual")
+        self.manual_mode_label.configure(text="MANUAL" if manual_enabled else "AUTO")
+        self.manual_throttle_scale.configure(state=tk.NORMAL)
+        for scale in self.manual_motor_scales:
+            scale.configure(state=tk.NORMAL)
+
+    def update_manual_throttle_label(self) -> None:
+        throttle_percent = self.manual_throttle_var.get()
+        throttle_us = 1000 + int((throttle_percent / 100.0) * 1000.0)
+        self.manual_throttle_value_label.configure(text=f"{throttle_percent}%\n{throttle_us}us")
+        for index, motor_var in enumerate(self.manual_motor_vars):
+            motor_percent = motor_var.get()
+            motor_us = 1000 + int((motor_percent / 100.0) * 1000.0)
+            self.manual_motor_value_labels[index].configure(text=f"{motor_percent}%\n{motor_us}us")
+
+    def send_manual_throttle_command(self) -> None:
+        throttle_percent = self.manual_throttle_var.get()
+        self.send_command(f"THROTTLE {throttle_percent}", "設定手動油門")
+
+    def on_manual_throttle_changed(self, _value: str) -> None:
+        if self.manual_slider_updating:
+            return
+        self.manual_slider_updating = True
+        throttle_percent = self.manual_throttle_var.get()
+        for motor_var in self.manual_motor_vars:
+            motor_var.set(throttle_percent)
+        self.manual_slider_updating = False
+        self.update_manual_throttle_label()
+        if self.control_mode_var.get() == "manual":
+            self.send_manual_throttle_command()
+            for index in range(4):
+                self.send_manual_motor_command(index)
+
+    def send_manual_motor_command(self, motor_index: int) -> None:
+        motor_percent = self.manual_motor_vars[motor_index].get()
+        self.send_command(f"MOTOR{motor_index + 1} {motor_percent}", f"設定 M{motor_index + 1} 油門")
+
+    def on_manual_motor_changed(self, motor_index: int) -> None:
+        if self.manual_slider_updating:
+            return
+        self.update_manual_throttle_label()
+        if self.control_mode_var.get() == "manual":
+            self.send_manual_motor_command(motor_index)
 
     def start_csv_logging(self) -> None:
         if self.csv_writer is not None:
@@ -396,6 +658,7 @@ class TelemetryApp:
                 self.value_vars[name].set(f"{value:.2f}")
             self.telemetry.last_update_monotonic = time.monotonic()
             self.horizon.redraw(self.telemetry.roll_deg, self.telemetry.pitch_deg, self.telemetry.yaw_deg)
+            self.update_stick_views()
             self.write_csv_row(values)
             return
 
@@ -423,6 +686,21 @@ class TelemetryApp:
 
         return values
 
+    def update_stick_views(self) -> None:
+        roll_percent = self.us_to_percent(self.telemetry.aileron_us, default=50.0)
+        pitch_percent = self.us_to_percent(self.telemetry.elevator_us, default=50.0)
+        throttle_percent = self.us_to_percent(self.telemetry.throttle_us, default=0.0)
+        yaw_percent = self.us_to_percent(self.telemetry.rudder_us, default=50.0)
+
+        self.left_stick.redraw(yaw_percent, throttle_percent)
+        self.right_stick.redraw(roll_percent, 100.0 - pitch_percent)
+
+    @staticmethod
+    def us_to_percent(pulse_us: float, default: float) -> float:
+        if pulse_us <= 0.0:
+            return default
+        return max(0.0, min(100.0, (pulse_us - 1000.0) * 0.1))
+
     def write_csv_row(self, values: list[float]) -> None:
         if self.csv_writer is None or self.csv_file is None:
             return
@@ -436,6 +714,30 @@ class TelemetryApp:
         self.log_text.insert(tk.END, line + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def on_main_frame_configure(self, _event) -> None:
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def on_canvas_configure(self, event) -> None:
+        min_width = 1380
+        window_width = max(event.width, min_width)
+        self.scroll_canvas.itemconfigure(self.main_frame_window, width=window_width)
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def on_root_resize(self, _event) -> None:
+        self.update_responsive_layout()
+
+    def update_responsive_layout(self) -> None:
+        if not hasattr(self, "manual_frame"):
+            return
+
+        manual_height = max(self.manual_frame.winfo_height(), 260)
+        slider_length = max(120, min(260, manual_height - 120))
+        for scale in [self.manual_throttle_scale, *self.manual_motor_scales]:
+            scale.configure(length=slider_length)
+
+        hint_wrap = max(240, min(420, self.manual_frame.winfo_width() - 30))
+        self.manual_hint_label.configure(wraplength=hint_wrap)
 
     def update_freshness(self) -> None:
         if self.telemetry.last_update_monotonic <= 0.0:
