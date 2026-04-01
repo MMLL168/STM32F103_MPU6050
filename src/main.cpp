@@ -13,8 +13,10 @@ constexpr uint32_t kLedToggleIntervalMs = 500;
 constexpr uint32_t kGyroPrintIntervalMs = 100;
 constexpr uint32_t kPidPrintIntervalMs = 100;
 constexpr uint32_t kElrsStatusIntervalMs = 100;
-constexpr uint16_t kImuCalibrationSamples = 600;
+constexpr uint16_t kImuCalibrationSamples = 250;
 constexpr uint32_t kImuHealthCheckDurationMs = 3000;
+constexpr uint32_t kImuBootSettleDelayMs = 2500;
+constexpr uint32_t kImuCalibrationRetryIntervalMs = 1000;
 constexpr uint8_t kMpuAddress = 0x68;
 constexpr uint8_t kRegWhoAmI = 0x75;
 constexpr uint8_t kRegPwrMgmt1 = 0x6B;
@@ -218,8 +220,7 @@ namespace GYRO {
         float temperatureC;
     };
 
-    uint32_t nextPrintTimeMs = 0;
-    uint32_t lastUpdateTimeMs = 0;
+    uint32_t lastUpdateTimeUs = 0;
     bool ready = false;
     bool calibrated = false;
     bool healthCheckComplete = false;
@@ -238,6 +239,8 @@ namespace GYRO {
     float yawDeg = 0.0f;
     float lastDtSeconds = 0.0f;
     uint32_t healthCheckStartTimeMs = 0;
+    uint32_t nextAutoCalibrationTimeMs = 0;
+    uint16_t autoCalibrationAttemptCount = 0;
     uint32_t healthSampleCount = 0;
     float healthGyroAbsSumX = 0.0f;
     float healthGyroAbsSumY = 0.0f;
@@ -259,10 +262,11 @@ namespace GYRO {
     constexpr float kAccelLsbPerG = 16384.0f;
     constexpr float kGyroLsbPerDps = 131.0f;
     constexpr float kComplementaryAlpha = 0.98f;
-    constexpr int16_t kCalibrationGyroSpanLimit = 220;
-    constexpr float kCalibrationAccelMagnitudeSpanLimit = 0.12f;
+    constexpr int16_t kCalibrationGyroSpanLimit = 350;
+    constexpr float kCalibrationAccelMagnitudeSpanLimit = 0.18f;
 
     void printPlotterHeader();
+    bool isReadyForTelemetry();
 
     float absfLocal(float value) {
         return (value >= 0.0f) ? value : -value;
@@ -414,16 +418,26 @@ namespace GYRO {
                                       (accelMagnitudeSpan < kCalibrationAccelMagnitudeSpanLimit);
 
         if (!boardStillEnough) {
-            Debug::logf(
-                "IMU calibration failed: board moved gyroSpan=(%d,%d,%d) accelMagSpan=%.3f\r\n",
-                gyroSpanX, gyroSpanY, gyroSpanZ, accelMagnitudeSpan
-            );
+            Debug::logf("IMU calibration failed: board moved ");
+            Debug::logf("gyroSpan=(%d,%d,%d)", gyroSpanX, gyroSpanY, gyroSpanZ);
+            Debug::comma();
+            Debug::keyValue("accelMagSpan_g", accelMagnitudeSpan, 3);
+            Debug::endLine();
             calibrated = false;
             return false;
         }
 
-        rollDeg = 0.0f;
-        pitchDeg = 0.0f;
+        ImuScaledSample calibratedGravity {};
+        calibratedGravity.accelXG = 0.0f;
+        calibratedGravity.accelYG = 0.0f;
+        calibratedGravity.accelZG = (accelOffsetZ >= 0.0f) ? 1.0f : -1.0f;
+        accelRollDeg = atan2f(calibratedGravity.accelYG, calibratedGravity.accelZG) * RAD_TO_DEG;
+        accelPitchDeg = atan2f(calibratedGravity.accelXG, sqrtf(
+            calibratedGravity.accelYG * calibratedGravity.accelYG +
+            calibratedGravity.accelZG * calibratedGravity.accelZG
+        )) * RAD_TO_DEG;
+        rollDeg = accelRollDeg;
+        pitchDeg = accelPitchDeg;
         yawDeg = 0.0f;
         calibrated = true;
 
@@ -451,7 +465,7 @@ namespace GYRO {
         }
 
         calibrated = calibrate();
-        lastUpdateTimeMs = millis();
+        lastUpdateTimeUs = micros();
         lastDtSeconds = 0.0f;
         latestScaledSample = {};
         resetHealthCheck();
@@ -461,13 +475,17 @@ namespace GYRO {
         return calibrated;
     }
 
+    void scheduleAutoCalibration(uint32_t delayMs) {
+        nextAutoCalibrationTimeMs = millis() + delayMs;
+    }
+
     void resetYaw() {
         yawDeg = 0.0f;
         Debug::logf("Yaw reset to 0 deg\r\n");
     }
 
     void updateAttitude(const ImuScaledSample &sample, float dtSeconds) {
-        accelRollDeg = atan2f(sample.accelYG, -sample.accelZG) * RAD_TO_DEG;
+        accelRollDeg = atan2f(sample.accelYG, sample.accelZG) * RAD_TO_DEG;
         accelPitchDeg = atan2f(sample.accelXG, sqrtf(sample.accelYG * sample.accelYG + sample.accelZG * sample.accelZG)) * RAD_TO_DEG;
 
         if (dtSeconds <= 0.0f || dtSeconds > 0.5f) {
@@ -550,6 +568,10 @@ namespace GYRO {
         Debug::logf("PLOTTER fields: ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,roll_deg,pitch_deg,yaw_deg,rc1,rc2,rc3,rc4,rc5,pid_roll_out,pid_pitch_out,pid_yaw_out\r\n");
     }
 
+    bool isReadyForTelemetry() {
+        return ready && calibrated;
+    }
+
     void setup() {
         MpuWire.begin();
         MpuWire.setClock(400000);
@@ -577,31 +599,57 @@ namespace GYRO {
         Debug::logf("MPU6050 ready=%d WHO_AM_I=0x%02X on SDA=%d SCL=%d\r\n", ready ? 1 : 0, whoAmI, MPU6050_I2C_SDA, MPU6050_I2C_SCL);
 
         if (ready) {
-            calibrated = calibrate();
-            lastUpdateTimeMs = millis();
+            lastUpdateTimeUs = micros();
             resetHealthCheck();
-            if (calibrated) {
-                printPlotterHeader();
-            }
+            autoCalibrationAttemptCount = 0;
+            scheduleAutoCalibration(Config::kImuBootSettleDelayMs);
+            Debug::logf(
+                "IMU auto calibration scheduled in %lu ms, keep the board still after power-on.\r\n",
+                Config::kImuBootSettleDelayMs
+            );
         }
     }
 
     void loop() {
-        if (!ready || !calibrated) {
+        if (!ready) {
             return;
         }
 
         const uint32_t now = millis();
-        if (now < nextPrintTimeMs) {
+        if (!calibrated) {
+            if (now < nextAutoCalibrationTimeMs) {
+                return;
+            }
+
+            ++autoCalibrationAttemptCount;
+            Debug::logf("IMU auto calibration attempt=%u\r\n", autoCalibrationAttemptCount);
+            calibrated = calibrate();
+            lastUpdateTimeUs = micros();
+            lastDtSeconds = 0.0f;
+            latestScaledSample = {};
+            resetHealthCheck();
+
+            if (calibrated) {
+                Debug::logf("IMU auto calibration OK\r\n");
+                printPlotterHeader();
+            } else {
+                Debug::logf(
+                    "IMU auto calibration retry in %lu ms\r\n",
+                    Config::kImuCalibrationRetryIntervalMs
+                );
+                scheduleAutoCalibration(Config::kImuCalibrationRetryIntervalMs);
+            }
             return;
         }
 
         ImuSample sample {};
         if (readSample(sample)) {
             const ImuScaledSample scaled = scaleSample(sample);
-            const uint32_t currentTimeMs = millis();
-            const float dtSeconds = static_cast<float>(currentTimeMs - lastUpdateTimeMs) / 1000.0f;
-            lastUpdateTimeMs = currentTimeMs;
+            const uint32_t currentTimeUs = micros();
+            const float dtSeconds = (lastUpdateTimeUs == 0)
+                ? 0.0f
+                : static_cast<float>(currentTimeUs - lastUpdateTimeUs) / 1000000.0f;
+            lastUpdateTimeUs = currentTimeUs;
             lastDtSeconds = dtSeconds;
             latestScaledSample = scaled;
 
@@ -610,8 +658,6 @@ namespace GYRO {
         } else {
             Debug::logf("MPU6050 data read failed\r\n");
         }
-
-        nextPrintTimeMs = now + Config::kGyroPrintIntervalMs;
     }
 }
 
@@ -776,6 +822,11 @@ namespace PID {
     }
 
     void loop(float rollDeg, float pitchDeg, float yawDeg, float dtSeconds) {
+        if (!GYRO::isReadyForTelemetry()) {
+            resetAll();
+            return;
+        }
+
         if (ELRS::signalValid) {
             const float rollStick = applyDeadband(rcToNormalized(ELRS::rcValues[0]), Config::kStickDeadband);
             const float pitchStick = applyDeadband(rcToNormalized(ELRS::rcValues[1]), Config::kStickDeadband);

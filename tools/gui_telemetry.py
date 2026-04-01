@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import math
 import queue
 import threading
@@ -12,7 +12,6 @@ from tkinter import filedialog, ttk
 
 import serial
 from serial.tools import list_ports
-
 
 CSV_FIELD_NAMES = [
     "ax_g",
@@ -107,12 +106,18 @@ class SerialReader(threading.Thread):
 class HorizonWidget(tk.Canvas):
     def __init__(self, master):
         super().__init__(master, width=360, height=360, bg="#0f172a", highlightthickness=0)
-        self.center_x = 180
-        self.center_y = 180
-        self.radius = 150
+        self.center_x = 180.0
+        self.center_y = 180.0
+        self.radius = 150.0
 
     def redraw(self, roll_deg: float, pitch_deg: float, yaw_deg: float) -> None:
         self.delete("all")
+
+        canvas_width = max(self.winfo_width(), 360)
+        canvas_height = max(self.winfo_height(), 360)
+        self.center_x = canvas_width / 2.0
+        self.center_y = canvas_height / 2.0
+        self.radius = min(canvas_width, canvas_height) * 0.42
 
         self.create_oval(
             self.center_x - self.radius,
@@ -212,15 +217,16 @@ class TelemetryApp:
         self.csv_writer: Optional[csv.writer] = None
 
         self.port_var = tk.StringVar()
-        self.baud_var = tk.StringVar(value="115200")
+        self.baud_var = tk.StringVar(value="57600")
         self.connection_var = tk.StringVar(value="尚未連線")
-        self.last_update_var = tk.StringVar(value="尚未收到資料")
+        self.last_update_var = tk.StringVar(value="等待 IMU/遙測資料")
         self.csv_path_var = tk.StringVar(value="未啟用 CSV 記錄")
 
-        self.value_vars: dict[str, tk.StringVar] = {name: tk.StringVar(value="0.00") for name in CSV_FIELD_NAMES}
+        self.value_vars: dict[str, tk.StringVar] = {name: tk.StringVar(value="--") for name in CSV_FIELD_NAMES}
 
         self._build_layout()
         self.refresh_ports()
+        self.reset_telemetry_view()
         self.root.after(50, self.process_queue)
         self.root.after(500, self.update_freshness)
 
@@ -258,7 +264,7 @@ class TelemetryApp:
         left.rowconfigure(1, weight=1)
 
         self.horizon = HorizonWidget(left)
-        self.horizon.pack(fill=tk.BOTH, expand=False)
+        self.horizon.pack(fill=tk.BOTH, expand=True)
 
         self.log_text = tk.Text(left, height=18, bg="#020617", fg="#e2e8f0", font=("Consolas", 10))
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -280,6 +286,12 @@ class TelemetryApp:
             ttk.Label(frame, text=field_name).grid(row=idx, column=0, sticky="w")
             ttk.Label(frame, textvariable=self.value_vars[field_name], font=("Consolas", 11)).grid(row=idx, column=1, sticky="e", padx=(12, 0))
 
+    def reset_telemetry_view(self) -> None:
+        self.telemetry = TelemetryState()
+        for name in CSV_FIELD_NAMES:
+            self.value_vars[name].set("--")
+        self.horizon.redraw(0.0, 0.0, 0.0)
+
     def refresh_ports(self) -> None:
         ports = [port.device for port in list_ports.comports()]
         self.port_combo["values"] = ports
@@ -298,6 +310,8 @@ class TelemetryApp:
             self.connection_var.set("Baud rate 格式錯誤")
             return
 
+        self.reset_telemetry_view()
+        self.last_update_var.set("等待 IMU/遙測資料")
         self.reader = SerialReader(self.port_var.get(), baudrate, self.message_queue)
         self.reader.start()
         self.connection_var.set(f"連線中 {self.port_var.get()} ...")
@@ -307,6 +321,8 @@ class TelemetryApp:
             self.reader.stop()
             self.reader = None
         self.connection_var.set("尚未連線")
+        self.last_update_var.set("等待 IMU/遙測資料")
+        self.reset_telemetry_view()
 
     def send_command(self, command: str, description: str) -> None:
         if self.reader is None or not self.reader.send_command(command):
@@ -316,6 +332,7 @@ class TelemetryApp:
         self.append_log(f">>> {command}")
 
     def calibrate_imu(self) -> None:
+        self.last_update_var.set("IMU 校正中，請保持靜止")
         self.send_command("CALIBRATE", "校正 IMU")
 
     def reset_yaw(self) -> None:
@@ -367,6 +384,7 @@ class TelemetryApp:
             elif event_type == "closed":
                 if self.connection_var.get().startswith("連線中") or self.connection_var.get().startswith("已連線"):
                     self.connection_var.set(f"{payload} 已斷線")
+                    self.last_update_var.set("等待 IMU/遙測資料")
 
         self.root.after(50, self.process_queue)
 
@@ -394,9 +412,16 @@ class TelemetryApp:
             return None
 
         try:
-            return [float(part) for part in parts]
+            values = [float(part) for part in parts]
         except ValueError:
             return None
+
+        all_zero = all(abs(value) < 1e-6 for value in values)
+        if all_zero:
+            self.last_update_var.set("等待 IMU/遙測資料")
+            return None
+
+        return values
 
     def write_csv_row(self, values: list[float]) -> None:
         if self.csv_writer is None or self.csv_file is None:
@@ -414,10 +439,13 @@ class TelemetryApp:
 
     def update_freshness(self) -> None:
         if self.telemetry.last_update_monotonic <= 0.0:
-            self.last_update_var.set("尚未收到資料")
+            self.last_update_var.set("等待 IMU/遙測資料")
         else:
             age = time.monotonic() - self.telemetry.last_update_monotonic
-            self.last_update_var.set(f"資料延遲 {age:.2f}s")
+            if age > 2.0:
+                self.last_update_var.set("等待 IMU/遙測資料")
+            else:
+                self.last_update_var.set(f"資料延遲 {age:.2f}s")
         self.root.after(500, self.update_freshness)
 
 
