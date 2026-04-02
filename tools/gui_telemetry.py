@@ -31,10 +31,10 @@ CSV_FIELD_NAMES = [
     "pid_roll_out",
     "pid_pitch_out",
     "pid_yaw_out",
-    "aileron_us",
-    "elevator_us",
-    "throttle_us",
-    "rudder_us",
+    "motor1_us",
+    "motor2_us",
+    "motor3_us",
+    "motor4_us",
 ]
 
 
@@ -57,10 +57,10 @@ class TelemetryState:
     pid_roll_out: float = 0.0
     pid_pitch_out: float = 0.0
     pid_yaw_out: float = 0.0
-    aileron_us: float = 0.0
-    elevator_us: float = 0.0
-    throttle_us: float = 0.0
-    rudder_us: float = 0.0
+    motor1_us: float = 0.0
+    motor2_us: float = 0.0
+    motor3_us: float = 0.0
+    motor4_us: float = 0.0
     status_lines: list[str] = field(default_factory=list)
     last_update_monotonic: float = 0.0
 
@@ -276,6 +276,8 @@ class TelemetryApp:
         self.manual_throttle_var = tk.IntVar(value=0)
         self.manual_motor_vars = [tk.IntVar(value=0) for _ in range(4)]
         self.manual_slider_updating = False
+        self.pwm_test_pulse_var = tk.IntVar(value=1500)
+        self.pwm_test_duty_var = tk.IntVar(value=50)
 
         self.value_vars: dict[str, tk.StringVar] = {name: tk.StringVar(value="--") for name in CSV_FIELD_NAMES}
 
@@ -319,6 +321,18 @@ class TelemetryApp:
         ttk.Button(top_bar, text="中斷", command=self.disconnect).pack(side=tk.LEFT, padx=8)
         ttk.Button(top_bar, text="校正 IMU", command=self.calibrate_imu).pack(side=tk.LEFT)
         ttk.Button(top_bar, text="重置 Yaw", command=self.reset_yaw).pack(side=tk.LEFT, padx=8)
+        ttk.Button(top_bar, text="方波400 測試 ON", command=self.enable_pwm_square_test).pack(side=tk.LEFT)
+        ttk.Button(top_bar, text="RAW TIM2 ON", command=self.enable_raw_tim2_test).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(top_bar, text="ESC400 測試 ON", command=self.enable_pwm_esc_test).pack(side=tk.LEFT, padx=8)
+        ttk.Button(top_bar, text="PWM 測試 OFF", command=self.disable_pwm_test).pack(side=tk.LEFT)
+        ttk.Button(top_bar, text="PA0 HIGH", command=self.enable_pa0_high_test).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top_bar, text="PA0 LOW", command=self.enable_pa0_low_test).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top_bar, text="PA0 1Hz", command=self.enable_pa0_blink_test).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top_bar, text="PA0 OFF", command=self.disable_pin_test).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(top_bar, text="Duty%").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Entry(top_bar, textvariable=self.pwm_test_duty_var, width=4).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(top_bar, text="脈寬us").pack(side=tk.LEFT)
+        ttk.Entry(top_bar, textvariable=self.pwm_test_pulse_var, width=6).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Button(top_bar, text="開始記錄 CSV", command=self.start_csv_logging).pack(side=tk.LEFT)
         ttk.Button(top_bar, text="停止記錄 CSV", command=self.stop_csv_logging).pack(side=tk.LEFT, padx=8)
         ttk.Label(top_bar, textvariable=self.connection_var).pack(side=tk.LEFT, padx=12)
@@ -365,7 +379,7 @@ class TelemetryApp:
         radio.rowconfigure(1, weight=1)
         ttk.Label(
             radio,
-            text="對應關係: aileron=橫滾  elevator=俯仰  throttle=總油門  rudder=偏航",
+            text="Quad X 控制量: rc1=Roll  rc2=Pitch  rc3=Throttle  rc4=Yaw；輸出層已混控成 M1~M4。",
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         self.left_stick = StickWidget(radio, "左搖桿", "Yaw", "Throttle", throttle_mode=True)
@@ -463,7 +477,7 @@ class TelemetryApp:
         self._add_group(
             right,
             "輸出 PWM",
-            ["aileron_us", "elevator_us", "throttle_us", "rudder_us"],
+            ["motor1_us", "motor2_us", "motor3_us", "motor4_us"],
             2,
             0,
             columnspan=2,
@@ -539,6 +553,36 @@ class TelemetryApp:
 
     def reset_yaw(self) -> None:
         self.send_command("RESET_YAW", "重置 Yaw")
+
+    def enable_pwm_square_test(self) -> None:
+        duty_percent = max(0, min(100, self.pwm_test_duty_var.get()))
+        self.pwm_test_duty_var.set(duty_percent)
+        self.send_command(f"PWMTESTDUTY {duty_percent}", "設定 PWM400 方波 Duty")
+        self.send_command("PWMTEST SQUARE ON", "啟用 PWM400 方波測試模式")
+
+    def enable_pwm_esc_test(self) -> None:
+        pulse_us = max(1000, min(2000, self.pwm_test_pulse_var.get()))
+        self.pwm_test_pulse_var.set(pulse_us)
+        self.send_command(f"PWMTESTUS {pulse_us}", "設定 PWM400 測試脈寬")
+        self.send_command("PWMTEST ESC ON", "啟用 ESC400 脈波測試模式")
+
+    def enable_raw_tim2_test(self) -> None:
+        self.send_command("PWMTEST RAWTIM2 ON", "啟用 TIM2 CH1 原始 400Hz 方波測試")
+
+    def disable_pwm_test(self) -> None:
+        self.send_command("PWMTEST OFF", "停用 PWM400 測試模式")
+
+    def enable_pa0_high_test(self) -> None:
+        self.send_command("PINTEST PA0 HIGH", "啟用 PA0 High 腳位身份測試")
+
+    def enable_pa0_low_test(self) -> None:
+        self.send_command("PINTEST PA0 LOW", "啟用 PA0 Low 腳位身份測試")
+
+    def enable_pa0_blink_test(self) -> None:
+        self.send_command("PINTEST PA0 BLINK", "啟用 PA0 1Hz 腳位身份測試")
+
+    def disable_pin_test(self) -> None:
+        self.send_command("PINTEST OFF", "停用 PA0 腳位身份測試")
 
     def on_control_mode_changed(self) -> None:
         mode = self.control_mode_var.get()
@@ -687,13 +731,19 @@ class TelemetryApp:
         return values
 
     def update_stick_views(self) -> None:
-        roll_percent = self.us_to_percent(self.telemetry.aileron_us, default=50.0)
-        pitch_percent = self.us_to_percent(self.telemetry.elevator_us, default=50.0)
-        throttle_percent = self.us_to_percent(self.telemetry.throttle_us, default=0.0)
-        yaw_percent = self.us_to_percent(self.telemetry.rudder_us, default=50.0)
+        roll_percent = self.rc_to_percent(self.telemetry.rc1, default=50.0)
+        pitch_percent = self.rc_to_percent(self.telemetry.rc2, default=50.0)
+        throttle_percent = self.rc_to_percent(self.telemetry.rc3, default=0.0)
+        yaw_percent = self.rc_to_percent(self.telemetry.rc4, default=50.0)
 
         self.left_stick.redraw(yaw_percent, throttle_percent)
         self.right_stick.redraw(roll_percent, 100.0 - pitch_percent)
+
+    @staticmethod
+    def rc_to_percent(rc_value: float, default: float) -> float:
+        if rc_value < 800.0 or rc_value > 2200.0:
+            return default
+        return max(0.0, min(100.0, (rc_value - 1000.0) * 0.1))
 
     @staticmethod
     def us_to_percent(pulse_us: float, default: float) -> float:

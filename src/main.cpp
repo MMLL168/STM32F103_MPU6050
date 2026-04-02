@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <Servo.h>
+#include <HardwareTimer.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -28,6 +28,8 @@ constexpr uint32_t kElrsSerialBaud = 420000;
 constexpr uint16_t kServoMinUs = 1000;
 constexpr uint16_t kServoMidUs = 1500;
 constexpr uint16_t kServoMaxUs = 2000;
+constexpr uint32_t kEscPwmFrequencyHz = 400;
+constexpr uint32_t kAuxPwmFrequencyHz = 50;
 constexpr float kMaxAngleTargetDeg = 30.0f;
 constexpr float kMaxYawRateDegPerSec = 120.0f;
 constexpr float kMaxRollPitchRateDegPerSec = 220.0f;
@@ -156,17 +158,18 @@ namespace LED {
 }
 
 namespace PWM {
-    Servo aileron;
-    Servo elevator;
-    Servo throttle;
-    Servo rudder;
-    Servo aux;
+#ifdef BOARD_STM32
+    HardwareTimer auxTimer(TIM3);
+#endif
     bool ready = false;
-    uint16_t lastAileronUs = Config::kServoMidUs;
-    uint16_t lastElevatorUs = Config::kServoMidUs;
-    uint16_t lastThrottleUs = Config::kServoMinUs;
-    uint16_t lastRudderUs = Config::kServoMidUs;
+    uint16_t lastMotor1Us = Config::kServoMinUs;
+    uint16_t lastMotor2Us = Config::kServoMinUs;
+    uint16_t lastMotor3Us = Config::kServoMinUs;
+    uint16_t lastMotor4Us = Config::kServoMinUs;
     uint16_t lastAuxUs = Config::kServoMidUs;
+    constexpr uint32_t kEscTimerClockHz = 9000000UL;
+    constexpr uint16_t kEscPrescaler = 8 - 1;
+    constexpr uint16_t kEscArr = 22500 - 1;
 
     uint16_t clampMicros(uint16_t pulseUs) {
         return constrain(pulseUs, Config::kServoMinUs, Config::kServoMaxUs);
@@ -176,42 +179,159 @@ namespace PWM {
         return clampMicros(map(constrain(percent, 0, 100), 0, 100, Config::kServoMinUs, Config::kServoMaxUs));
     }
 
-    void setup() {
-        aileron.attach(PWM_AILERON_PIN, Config::kServoMinUs, Config::kServoMaxUs);
-        elevator.attach(PWM_ELEVATOR_PIN, Config::kServoMinUs, Config::kServoMaxUs);
-        throttle.attach(PWM_THROTTLE_PIN, Config::kServoMinUs, Config::kServoMaxUs);
-        rudder.attach(PWM_RUDDER_PIN, Config::kServoMinUs, Config::kServoMaxUs);
-        aux.attach(PWM_AUX_PIN, Config::kServoMinUs, Config::kServoMaxUs);
+#ifdef BOARD_STM32
+    uint32_t microsToEscTicks(uint16_t pulseUs) {
+        return static_cast<uint32_t>(pulseUs) * (kEscTimerClockHz / 1000000UL);
+    }
 
-        aileron.writeMicroseconds(Config::kServoMidUs);
-        elevator.writeMicroseconds(Config::kServoMidUs);
-        throttle.writeMicroseconds(Config::kServoMinUs);
-        rudder.writeMicroseconds(Config::kServoMidUs);
-        aux.writeMicroseconds(Config::kServoMidUs);
-        lastAileronUs = Config::kServoMidUs;
-        lastElevatorUs = Config::kServoMidUs;
-        lastThrottleUs = Config::kServoMinUs;
-        lastRudderUs = Config::kServoMidUs;
+    uint32_t dutyToEscTicks(uint8_t dutyPercent) {
+        return (static_cast<uint32_t>(kEscArr + 1) * constrain(dutyPercent, 0, 100)) / 100U;
+    }
+
+    void initEscTimerRegisters() {
+        __HAL_RCC_AFIO_CLK_ENABLE();
+        __HAL_RCC_TIM2_CLK_ENABLE();
+        __HAL_RCC_GPIOA_CLK_ENABLE();
+
+        AFIO->MAPR &= ~AFIO_MAPR_TIM2_REMAP;
+
+        // PA0~PA3 = AF Push-Pull, 50MHz
+        GPIOA->CRL &= ~(GPIO_CRL_MODE0 | GPIO_CRL_CNF0 |
+                        GPIO_CRL_MODE1 | GPIO_CRL_CNF1 |
+                        GPIO_CRL_MODE2 | GPIO_CRL_CNF2 |
+                        GPIO_CRL_MODE3 | GPIO_CRL_CNF3);
+        GPIOA->CRL |= (GPIO_CRL_MODE0_1 | GPIO_CRL_MODE0_0 | GPIO_CRL_CNF0_1 |
+                       GPIO_CRL_MODE1_1 | GPIO_CRL_MODE1_0 | GPIO_CRL_CNF1_1 |
+                       GPIO_CRL_MODE2_1 | GPIO_CRL_MODE2_0 | GPIO_CRL_CNF2_1 |
+                       GPIO_CRL_MODE3_1 | GPIO_CRL_MODE3_0 | GPIO_CRL_CNF3_1);
+
+        TIM2->CR1 = 0;
+        TIM2->CR2 = 0;
+        TIM2->SMCR = 0;
+        TIM2->DIER = 0;
+        TIM2->CCER = 0;
+        TIM2->CCMR1 = 0;
+        TIM2->CCMR2 = 0;
+        TIM2->PSC = kEscPrescaler;
+        TIM2->ARR = kEscArr;
+        TIM2->CCR1 = microsToEscTicks(lastMotor1Us);
+        TIM2->CCR2 = microsToEscTicks(lastMotor2Us);
+        TIM2->CCR3 = microsToEscTicks(lastMotor3Us);
+        TIM2->CCR4 = microsToEscTicks(lastMotor4Us);
+        TIM2->EGR = TIM_EGR_UG;
+
+        TIM2->CCMR1 |= (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
+        TIM2->CCMR1 |= (6U << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
+        TIM2->CCMR2 |= (6U << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
+        TIM2->CCMR2 |= (6U << TIM_CCMR2_OC4M_Pos) | TIM_CCMR2_OC4PE;
+
+        TIM2->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E | TIM_CCER_CC4E;
+        TIM2->CR1 |= TIM_CR1_ARPE;
+        TIM2->CR1 |= TIM_CR1_CEN;
+    }
+
+    void writeEscTicks(uint32_t motor1Ticks, uint32_t motor2Ticks, uint32_t motor3Ticks, uint32_t motor4Ticks) {
+        TIM2->CCR1 = motor1Ticks;
+        TIM2->CCR2 = motor2Ticks;
+        TIM2->CCR3 = motor3Ticks;
+        TIM2->CCR4 = motor4Ticks;
+    }
+#endif
+
+    void setup() {
+        lastMotor1Us = Config::kServoMinUs;
+        lastMotor2Us = Config::kServoMinUs;
+        lastMotor3Us = Config::kServoMinUs;
+        lastMotor4Us = Config::kServoMinUs;
         lastAuxUs = Config::kServoMidUs;
+
+#ifdef BOARD_STM32
+        initEscTimerRegisters();
+
+        auxTimer.pause();
+        auxTimer.setOverflow(Config::kAuxPwmFrequencyHz, HERTZ_FORMAT);
+        auxTimer.setMode(1, TIMER_OUTPUT_COMPARE_PWM1, PWM_AUX_PIN);
+        auxTimer.setCaptureCompare(1, lastAuxUs, MICROSEC_COMPARE_FORMAT);
+        auxTimer.refresh();
+        auxTimer.resume();
+#endif
         ready = true;
     }
 
-    void setAllPositions(int ailerons, int elevatorValue, int throttleValue, int rudderValue, int auxValue) {
+    void applyEscPulseAll(uint16_t pulseUs) {
         if (!ready) {
             return;
         }
 
-        lastAileronUs = percentToMicros(ailerons);
-        lastElevatorUs = percentToMicros(elevatorValue);
-        lastThrottleUs = percentToMicros(throttleValue);
-        lastRudderUs = percentToMicros(rudderValue);
+        const uint16_t clampedPulseUs = clampMicros(pulseUs);
+        lastMotor1Us = clampedPulseUs;
+        lastMotor2Us = clampedPulseUs;
+        lastMotor3Us = clampedPulseUs;
+        lastMotor4Us = clampedPulseUs;
+
+#ifdef BOARD_STM32
+        writeEscTicks(
+            microsToEscTicks(clampedPulseUs),
+            microsToEscTicks(clampedPulseUs),
+            microsToEscTicks(clampedPulseUs),
+            microsToEscTicks(clampedPulseUs)
+        );
+#endif
+    }
+
+    void setMotorPercents(int motor1Percent, int motor2Percent, int motor3Percent, int motor4Percent, int auxValue) {
+        if (!ready) {
+            return;
+        }
+
+        lastMotor1Us = percentToMicros(motor1Percent);
+        lastMotor2Us = percentToMicros(motor2Percent);
+        lastMotor3Us = percentToMicros(motor3Percent);
+        lastMotor4Us = percentToMicros(motor4Percent);
         lastAuxUs = percentToMicros(auxValue);
 
-        aileron.writeMicroseconds(lastAileronUs);
-        elevator.writeMicroseconds(lastElevatorUs);
-        throttle.writeMicroseconds(lastThrottleUs);
-        rudder.writeMicroseconds(lastRudderUs);
-        aux.writeMicroseconds(lastAuxUs);
+#ifdef BOARD_STM32
+        writeEscTicks(
+            microsToEscTicks(lastMotor1Us),
+            microsToEscTicks(lastMotor2Us),
+            microsToEscTicks(lastMotor3Us),
+            microsToEscTicks(lastMotor4Us)
+        );
+
+        auxTimer.setCaptureCompare(1, lastAuxUs, MICROSEC_COMPARE_FORMAT);
+        auxTimer.refresh();
+#endif
+    }
+
+    void setEscSquareDutyAll(uint8_t dutyPercent) {
+#ifdef BOARD_STM32
+        lastMotor1Us = 0;
+        lastMotor2Us = 0;
+        lastMotor3Us = 0;
+        lastMotor4Us = 0;
+        const uint32_t dutyTicks = dutyToEscTicks(dutyPercent);
+        writeEscTicks(dutyTicks, dutyTicks, dutyTicks, dutyTicks);
+#else
+        (void)dutyPercent;
+#endif
+    }
+
+    void logEscTimerState(const char *label) {
+#ifdef BOARD_STM32
+        Debug::logf(
+            "%s freq=%luHz psc=%lu arr=%lu ccr1=%lu ccr2=%lu ccr3=%lu ccr4=%lu\r\n",
+            label,
+            static_cast<unsigned long>(Config::kEscPwmFrequencyHz),
+            static_cast<unsigned long>(TIM2->PSC),
+            static_cast<unsigned long>(TIM2->ARR + 1),
+            static_cast<unsigned long>(TIM2->CCR1),
+            static_cast<unsigned long>(TIM2->CCR2),
+            static_cast<unsigned long>(TIM2->CCR3),
+            static_cast<unsigned long>(TIM2->CCR4)
+        );
+#else
+        (void)label;
+#endif
     }
 }
 
@@ -243,6 +363,160 @@ namespace ManualControl {
         }
 
         motorPercents[motorIndex] = constrain(percent, 0, 100);
+    }
+}
+
+namespace PwmTest {
+    enum class Mode : uint8_t {
+        Off = 0,
+        SquareWave400Hz,
+        EscPulse400Hz,
+        RawTim2Ch1Square400Hz,
+    };
+
+    Mode mode = Mode::Off;
+    uint16_t pulseUs = 1500;
+    uint8_t dutyPercent = 50;
+
+    void setMode(Mode value) {
+        mode = value;
+    }
+
+    void setPulseUs(int pulse) {
+        pulseUs = constrain(pulse, static_cast<int>(Config::kServoMinUs), static_cast<int>(Config::kServoMaxUs));
+    }
+
+    void setDutyPercent(int duty) {
+        dutyPercent = constrain(duty, 0, 100);
+    }
+}
+
+namespace PinTest {
+    enum class Mode : uint8_t {
+        Off = 0,
+        Pa0High,
+        Pa0Low,
+        Pa0Blink1Hz,
+    };
+
+    Mode mode = Mode::Off;
+    bool pa0StateHigh = false;
+    uint32_t nextToggleTimeMs = 0;
+
+    void applyPa0Level(bool high) {
+        pinMode(PWM_AILERON_PIN, OUTPUT);
+        digitalWrite(PWM_AILERON_PIN, high ? HIGH : LOW);
+        pa0StateHigh = high;
+    }
+
+    void restorePwmOutputs() {
+        PWM::setup();
+    }
+
+    void setMode(Mode value) {
+        mode = value;
+        if (mode == Mode::Off) {
+            restorePwmOutputs();
+            Debug::logf("PINTEST PA0 OFF, PWM restored\r\n");
+            return;
+        }
+
+        if (mode == Mode::Pa0High) {
+            applyPa0Level(true);
+            Debug::logf("PINTEST PA0 HIGH OK\r\n");
+            return;
+        }
+
+        if (mode == Mode::Pa0Low) {
+            applyPa0Level(false);
+            Debug::logf("PINTEST PA0 LOW OK\r\n");
+            return;
+        }
+
+        applyPa0Level(false);
+        nextToggleTimeMs = millis() + 500;
+        Debug::logf("PINTEST PA0 BLINK1HZ OK\r\n");
+    }
+
+    void loop() {
+        if (mode != Mode::Pa0Blink1Hz) {
+            return;
+        }
+
+        const uint32_t now = millis();
+        if (now < nextToggleTimeMs) {
+            return;
+        }
+
+        applyPa0Level(!pa0StateHigh);
+        nextToggleTimeMs = now + 500;
+    }
+}
+
+namespace RawTimerTest {
+    bool enabled = false;
+
+    void enablePa0Tim2Square400Hz50() {
+        if (enabled) {
+            return;
+        }
+
+#ifdef BOARD_STM32
+        pinMode(PWM_AILERON_PIN, OUTPUT);
+
+        __HAL_RCC_AFIO_CLK_ENABLE();
+        __HAL_RCC_TIM2_CLK_ENABLE();
+        __HAL_RCC_GPIOA_CLK_ENABLE();
+
+        AFIO->MAPR &= ~AFIO_MAPR_TIM2_REMAP;
+
+        GPIOA->CRL &= ~(GPIO_CRL_MODE0 | GPIO_CRL_CNF0);
+        GPIOA->CRL |= GPIO_CRL_MODE0_1 | GPIO_CRL_MODE0_0;
+        GPIOA->CRL |= GPIO_CRL_CNF0_1;
+
+        TIM2->CR1 = 0;
+        TIM2->CR2 = 0;
+        TIM2->SMCR = 0;
+        TIM2->DIER = 0;
+        TIM2->CCER = 0;
+        TIM2->CCMR1 = 0;
+        TIM2->CCMR2 = 0;
+        TIM2->PSC = 8 - 1;       // 72MHz / 8 = 9MHz timer clock
+        TIM2->ARR = 22500 - 1;   // 9MHz / 22500 = 400Hz
+        TIM2->CCR1 = 11250;      // 50% duty
+        TIM2->EGR = TIM_EGR_UG;
+        TIM2->CCMR1 |= (6U << TIM_CCMR1_OC1M_Pos);
+        TIM2->CCMR1 |= TIM_CCMR1_OC1PE;
+        TIM2->CCER |= TIM_CCER_CC1E;
+        TIM2->CR1 |= TIM_CR1_ARPE;
+        TIM2->BDTR = 0;
+        TIM2->CR1 |= TIM_CR1_CEN;
+#endif
+        enabled = true;
+    }
+
+    void disable() {
+        enabled = false;
+        PWM::setup();
+    }
+
+    void logState(const char *label) {
+#ifdef BOARD_STM32
+        Debug::logf(
+            "%s MAPR=0x%08lX GPIOA_CRL=0x%08lX TIM2_CR1=0x%08lX TIM2_CCMR1=0x%08lX TIM2_CCER=0x%08lX PSC=%lu ARR=%lu CCR1=%lu\r\n",
+            label,
+            static_cast<unsigned long>(AFIO->MAPR),
+            static_cast<unsigned long>(GPIOA->CRL),
+            static_cast<unsigned long>(TIM2->CR1),
+            static_cast<unsigned long>(TIM2->CCMR1),
+            static_cast<unsigned long>(TIM2->CCER),
+            static_cast<unsigned long>(TIM2->PSC),
+            static_cast<unsigned long>(TIM2->ARR),
+            static_cast<unsigned long>(TIM2->CCR1)
+        );
+#else
+        (void)label;
+#endif
     }
 }
 
@@ -612,7 +886,7 @@ namespace GYRO {
     }
 
     void printPlotterHeader() {
-        Debug::logf("PLOTTER fields: ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,roll_deg,pitch_deg,yaw_deg,rc1,rc2,rc3,rc4,rc5,pid_roll_out,pid_pitch_out,pid_yaw_out,aileron_us,elevator_us,throttle_us,rudder_us\r\n");
+        Debug::logf("PLOTTER fields: ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,roll_deg,pitch_deg,yaw_deg,rc1,rc2,rc3,rc4,rc5,pid_roll_out,pid_pitch_out,pid_yaw_out,motor1_us,motor2_us,motor3_us,motor4_us\r\n");
     }
 
     bool isReadyForTelemetry() {
@@ -860,8 +1134,31 @@ namespace PID {
     }
 
     void applyControlOutputs() {
+        if (PwmTest::mode == PwmTest::Mode::SquareWave400Hz) {
+            PWM::setEscSquareDutyAll(PwmTest::dutyPercent);
+            return;
+        }
+
+        if (PwmTest::mode == PwmTest::Mode::EscPulse400Hz) {
+            const int testPercent = map(PwmTest::pulseUs, Config::kServoMinUs, Config::kServoMaxUs, 0, 100);
+            PWM::setMotorPercents(
+                testPercent,
+                testPercent,
+                testPercent,
+                testPercent,
+                50);
+            return;
+        }
+
+        if (PwmTest::mode == PwmTest::Mode::RawTim2Ch1Square400Hz) {
+            if (!RawTimerTest::enabled) {
+                RawTimerTest::enablePa0Tim2Square400Hz50();
+            }
+            return;
+        }
+
         if (ManualControl::enabled) {
-            PWM::setAllPositions(
+            PWM::setMotorPercents(
                 ManualControl::motorPercents[0],
                 ManualControl::motorPercents[1],
                 ManualControl::motorPercents[2],
@@ -870,46 +1167,25 @@ namespace PID {
             return;
         }
 
-        const int aileronPercent = constrain(static_cast<int>(50.0f + roll.output), 0, 100);
-        const int elevatorPercent = constrain(static_cast<int>(50.0f + pitch.output), 0, 100);
         const int throttlePercent = constrain(ELRS::throttlePercent, 0, 100);
-        const int rudderPercent = constrain(static_cast<int>(50.0f + yaw.output), 0, 100);
         const int auxPercent = constrain(ELRS::auxPercent, 0, 100);
-        PWM::setAllPositions(aileronPercent, elevatorPercent, throttlePercent, rudderPercent, auxPercent);
+        const float rollMix = roll.output;
+        const float pitchMix = pitch.output;
+        const float yawMix = yaw.output;
+
+        // Quad X mixer:
+        // M1 = Front Left  (CCW)
+        // M2 = Front Right (CW)
+        // M3 = Rear Right  (CCW)
+        // M4 = Rear Left   (CW)
+        const int motor1Percent = constrain(static_cast<int>(throttlePercent + pitchMix + rollMix - yawMix), 0, 100);
+        const int motor2Percent = constrain(static_cast<int>(throttlePercent + pitchMix - rollMix + yawMix), 0, 100);
+        const int motor3Percent = constrain(static_cast<int>(throttlePercent - pitchMix - rollMix - yawMix), 0, 100);
+        const int motor4Percent = constrain(static_cast<int>(throttlePercent - pitchMix + rollMix + yawMix), 0, 100);
+        PWM::setMotorPercents(motor1Percent, motor2Percent, motor3Percent, motor4Percent, auxPercent);
     }
 
-    void loop(float rollDeg, float pitchDeg, float yawDeg, float dtSeconds) {
-        if (!GYRO::isReadyForTelemetry()) {
-            resetAll();
-            return;
-        }
-
-        if (ELRS::signalValid) {
-            const float rollStick = applyDeadband(rcToNormalized(ELRS::rcValues[0]), Config::kStickDeadband);
-            const float pitchStick = applyDeadband(rcToNormalized(ELRS::rcValues[1]), Config::kStickDeadband);
-            const float yawStick = applyDeadband(rcToNormalized(ELRS::rcValues[3]), Config::kStickDeadband);
-
-            roll.angleTargetDeg = rollStick * Config::kMaxAngleTargetDeg;
-            pitch.angleTargetDeg = pitchStick * Config::kMaxAngleTargetDeg;
-            yaw.rateTargetDegPerSec = yawStick * Config::kMaxYawRateDegPerSec;
-        } else {
-            roll.angleTargetDeg = 0.0f;
-            pitch.angleTargetDeg = 0.0f;
-            yaw.rateTargetDegPerSec = 0.0f;
-            resetAll();
-        }
-
-        updateAngleLoop(roll, rollDeg, Config::kMaxRollPitchRateDegPerSec, dtSeconds);
-        updateAngleLoop(pitch, pitchDeg, Config::kMaxRollPitchRateDegPerSec, dtSeconds);
-
-        roll.rateTargetDegPerSec = roll.angleOutputRateDegPerSec;
-        pitch.rateTargetDegPerSec = pitch.angleOutputRateDegPerSec;
-
-        updateRateLoop(roll, GYRO::latestScaledSample.gyroXDps, dtSeconds);
-        updateRateLoop(pitch, GYRO::latestScaledSample.gyroYDps, dtSeconds);
-        updateRateLoop(yaw, GYRO::latestScaledSample.gyroZDps, dtSeconds);
-        applyControlOutputs();
-
+    void printTelemetry(float yawDeg) {
         const uint32_t now = millis();
         if (now < nextPrintTimeMs) {
             return;
@@ -949,15 +1225,73 @@ namespace PID {
         Debug::comma();
         Debug::csvFloat(yaw.output, 2);
         Debug::comma();
-        Debug::csvFloat(static_cast<float>(PWM::lastAileronUs), 0);
+        Debug::csvFloat(static_cast<float>(PWM::lastMotor1Us), 0);
         Debug::comma();
-        Debug::csvFloat(static_cast<float>(PWM::lastElevatorUs), 0);
+        Debug::csvFloat(static_cast<float>(PWM::lastMotor2Us), 0);
         Debug::comma();
-        Debug::csvFloat(static_cast<float>(PWM::lastThrottleUs), 0);
+        Debug::csvFloat(static_cast<float>(PWM::lastMotor3Us), 0);
         Debug::comma();
-        Debug::csvFloat(static_cast<float>(PWM::lastRudderUs), 0);
+        Debug::csvFloat(static_cast<float>(PWM::lastMotor4Us), 0);
         Debug::endLine();
         nextPrintTimeMs = now + Config::kPidPrintIntervalMs;
+    }
+
+    void loop(float rollDeg, float pitchDeg, float yawDeg, float dtSeconds) {
+        if (PinTest::mode != PinTest::Mode::Off) {
+            return;
+        }
+
+        if (PwmTest::mode != PwmTest::Mode::Off) {
+            applyControlOutputs();
+            if (GYRO::isReadyForTelemetry()) {
+                roll.angleMeasurementDeg = rollDeg;
+                pitch.angleMeasurementDeg = pitchDeg;
+                printTelemetry(yawDeg);
+            }
+            return;
+        }
+
+        if (ManualControl::enabled) {
+            applyControlOutputs();
+            if (GYRO::isReadyForTelemetry()) {
+                roll.angleMeasurementDeg = rollDeg;
+                pitch.angleMeasurementDeg = pitchDeg;
+                printTelemetry(yawDeg);
+            }
+            return;
+        }
+
+        if (!GYRO::isReadyForTelemetry()) {
+            resetAll();
+            return;
+        }
+
+        if (ELRS::signalValid) {
+            const float rollStick = applyDeadband(rcToNormalized(ELRS::rcValues[0]), Config::kStickDeadband);
+            const float pitchStick = applyDeadband(rcToNormalized(ELRS::rcValues[1]), Config::kStickDeadband);
+            const float yawStick = applyDeadband(rcToNormalized(ELRS::rcValues[3]), Config::kStickDeadband);
+
+            roll.angleTargetDeg = rollStick * Config::kMaxAngleTargetDeg;
+            pitch.angleTargetDeg = pitchStick * Config::kMaxAngleTargetDeg;
+            yaw.rateTargetDegPerSec = yawStick * Config::kMaxYawRateDegPerSec;
+        } else {
+            roll.angleTargetDeg = 0.0f;
+            pitch.angleTargetDeg = 0.0f;
+            yaw.rateTargetDegPerSec = 0.0f;
+            resetAll();
+        }
+
+        updateAngleLoop(roll, rollDeg, Config::kMaxRollPitchRateDegPerSec, dtSeconds);
+        updateAngleLoop(pitch, pitchDeg, Config::kMaxRollPitchRateDegPerSec, dtSeconds);
+
+        roll.rateTargetDegPerSec = roll.angleOutputRateDegPerSec;
+        pitch.rateTargetDegPerSec = pitch.angleOutputRateDegPerSec;
+
+        updateRateLoop(roll, GYRO::latestScaledSample.gyroXDps, dtSeconds);
+        updateRateLoop(pitch, GYRO::latestScaledSample.gyroYDps, dtSeconds);
+        updateRateLoop(yaw, GYRO::latestScaledSample.gyroZDps, dtSeconds);
+        applyControlOutputs();
+        printTelemetry(yawDeg);
     }
 }
 
@@ -988,15 +1322,94 @@ namespace Command {
         }
 
         if (strcmp(line, "MODE AUTO") == 0) {
+            RawTimerTest::disable();
+            PinTest::setMode(PinTest::Mode::Off);
             ManualControl::setEnabled(false);
+            PwmTest::setMode(PwmTest::Mode::Off);
             Debug::logf("CMD MODE AUTO OK\r\n");
             return;
         }
 
         if (strcmp(line, "MODE MANUAL") == 0) {
+            RawTimerTest::disable();
+            PinTest::setMode(PinTest::Mode::Off);
+            PwmTest::setMode(PwmTest::Mode::Off);
             ManualControl::setEnabled(true);
             ManualControl::setAllMotorsPercent(0);
             Debug::logf("CMD MODE MANUAL OK\r\n");
+            return;
+        }
+
+        if (strcmp(line, "PINTEST PA0 HIGH") == 0) {
+            RawTimerTest::disable();
+            ManualControl::setEnabled(false);
+            PwmTest::setMode(PwmTest::Mode::Off);
+            PinTest::setMode(PinTest::Mode::Pa0High);
+            Debug::logf("CMD PINTEST PA0 HIGH OK\r\n");
+            return;
+        }
+
+        if (strcmp(line, "PINTEST PA0 LOW") == 0) {
+            RawTimerTest::disable();
+            ManualControl::setEnabled(false);
+            PwmTest::setMode(PwmTest::Mode::Off);
+            PinTest::setMode(PinTest::Mode::Pa0Low);
+            Debug::logf("CMD PINTEST PA0 LOW OK\r\n");
+            return;
+        }
+
+        if (strcmp(line, "PINTEST PA0 BLINK") == 0) {
+            RawTimerTest::disable();
+            ManualControl::setEnabled(false);
+            PwmTest::setMode(PwmTest::Mode::Off);
+            PinTest::setMode(PinTest::Mode::Pa0Blink1Hz);
+            Debug::logf("CMD PINTEST PA0 BLINK OK\r\n");
+            return;
+        }
+
+        if (strcmp(line, "PINTEST OFF") == 0) {
+            RawTimerTest::disable();
+            PinTest::setMode(PinTest::Mode::Off);
+            Debug::logf("CMD PINTEST OFF OK\r\n");
+            return;
+        }
+
+        if (strcmp(line, "PWMTEST RAWTIM2 ON") == 0) {
+            ManualControl::setEnabled(false);
+            PinTest::setMode(PinTest::Mode::Off);
+            PwmTest::setMode(PwmTest::Mode::RawTim2Ch1Square400Hz);
+            RawTimerTest::enablePa0Tim2Square400Hz50();
+            Debug::logf("CMD PWMTEST RAWTIM2 ON OK\r\n");
+            RawTimerTest::logState("PWMTEST RAWTIM2");
+            return;
+        }
+
+        if (strcmp(line, "PWMTEST SQUARE ON") == 0) {
+            RawTimerTest::disable();
+            PinTest::setMode(PinTest::Mode::Off);
+            ManualControl::setEnabled(false);
+            PwmTest::setMode(PwmTest::Mode::SquareWave400Hz);
+            PWM::setEscSquareDutyAll(PwmTest::dutyPercent);
+            Debug::logf("CMD PWMTEST SQUARE ON OK duty=%u\r\n", PwmTest::dutyPercent);
+            PWM::logEscTimerState("PWMTEST SQUARE");
+            return;
+        }
+
+        if (strcmp(line, "PWMTEST ESC ON") == 0) {
+            RawTimerTest::disable();
+            PinTest::setMode(PinTest::Mode::Off);
+            ManualControl::setEnabled(false);
+            PwmTest::setMode(PwmTest::Mode::EscPulse400Hz);
+            PWM::applyEscPulseAll(PwmTest::pulseUs);
+            Debug::logf("CMD PWMTEST ESC ON OK pulse=%u\r\n", PwmTest::pulseUs);
+            PWM::logEscTimerState("PWMTEST ESC");
+            return;
+        }
+
+        if (strcmp(line, "PWMTEST OFF") == 0) {
+            RawTimerTest::disable();
+            PwmTest::setMode(PwmTest::Mode::Off);
+            Debug::logf("CMD PWMTEST OFF OK\r\n");
             return;
         }
 
@@ -1004,6 +1417,28 @@ namespace Command {
         if (sscanf(line, "THROTTLE %d", &throttlePercent) == 1) {
             ManualControl::setAllMotorsPercent(throttlePercent);
             Debug::logf("CMD THROTTLE %d OK\r\n", ManualControl::masterThrottlePercent);
+            return;
+        }
+
+        int pulseUs = 0;
+        if (sscanf(line, "PWMTESTUS %d", &pulseUs) == 1) {
+            PwmTest::setPulseUs(pulseUs);
+            Debug::logf("CMD PWMTESTUS %u OK\r\n", PwmTest::pulseUs);
+            if (PwmTest::mode == PwmTest::Mode::EscPulse400Hz) {
+                PWM::applyEscPulseAll(PwmTest::pulseUs);
+                PWM::logEscTimerState("PWMTEST ESC UPDATE");
+            }
+            return;
+        }
+
+        int dutyPercent = 0;
+        if (sscanf(line, "PWMTESTDUTY %d", &dutyPercent) == 1) {
+            PwmTest::setDutyPercent(dutyPercent);
+            Debug::logf("CMD PWMTESTDUTY %u OK\r\n", PwmTest::dutyPercent);
+            if (PwmTest::mode == PwmTest::Mode::SquareWave400Hz) {
+                PWM::setEscSquareDutyAll(PwmTest::dutyPercent);
+                PWM::logEscTimerState("PWMTEST SQUARE UPDATE");
+            }
             return;
         }
 
@@ -1131,6 +1566,7 @@ void setup() {
 
 void loop() {
     Command::loop();
+    PinTest::loop();
     LED::loop();
     GYRO::loop();
     ELRS::loop();
