@@ -39,6 +39,18 @@ constexpr float kIntegralLimitAngle = 25.0f;
 constexpr float kIntegralLimitRate = 40.0f;
 constexpr float kStickDeadband = 0.05f;
 constexpr uint32_t kRcSignalTimeoutMs = 300;
+constexpr uint32_t kBootStateMinMs = 3500;
+constexpr uint32_t kFailsafeDisarmDelayMs = 1000;
+constexpr int kArmThrottleMaxPercent = 5;
+constexpr int kMotorIdlePercent = 6;
+constexpr int kMotorOutputMinPercent = 0;
+constexpr float kGyroLowPassHz = 45.0f;
+constexpr float kAccelLowPassHz = 12.0f;
+constexpr float kDTermLowPassHz = 28.0f;
+constexpr float kRcSmoothingHz = 12.0f;
+constexpr bool kEnableGyroNotch = false;
+constexpr float kGyroNotchCenterHz = 120.0f;
+constexpr float kGyroNotchQ = 4.0f;
 }
 
 #ifndef LED_PIN
@@ -134,6 +146,86 @@ namespace Debug {
         port->print(':');
         port->print(value, digits);
     }
+}
+
+namespace Filter {
+    struct FirstOrder {
+        bool initialized = false;
+        float state = 0.0f;
+
+        void reset(float value) {
+            initialized = true;
+            state = value;
+        }
+
+        float update(float input, float dtSeconds, float cutoffHz) {
+            if (!initialized || dtSeconds <= 0.0f || cutoffHz <= 0.0f) {
+                reset(input);
+                return state;
+            }
+
+            const float rc = 1.0f / (2.0f * PI * cutoffHz);
+            const float alpha = dtSeconds / (dtSeconds + rc);
+            state += alpha * (input - state);
+            return state;
+        }
+    };
+
+    struct BiquadNotch {
+        bool configured = false;
+        float b0 = 1.0f;
+        float b1 = 0.0f;
+        float b2 = 0.0f;
+        float a1 = 0.0f;
+        float a2 = 0.0f;
+        float x1 = 0.0f;
+        float x2 = 0.0f;
+        float y1 = 0.0f;
+        float y2 = 0.0f;
+
+        void configure(float sampleRateHz, float centerHz, float q) {
+            if (sampleRateHz <= 1.0f || centerHz <= 0.0f || q <= 0.0f) {
+                configured = false;
+                return;
+            }
+
+            const float omega = 2.0f * PI * centerHz / sampleRateHz;
+            const float alpha = sinf(omega) / (2.0f * q);
+            const float cosOmega = cosf(omega);
+
+            const float a0 = 1.0f + alpha;
+            b0 = 1.0f / a0;
+            b1 = (-2.0f * cosOmega) / a0;
+            b2 = 1.0f / a0;
+            a1 = (-2.0f * cosOmega) / a0;
+            a2 = (1.0f - alpha) / a0;
+            x1 = 0.0f;
+            x2 = 0.0f;
+            y1 = 0.0f;
+            y2 = 0.0f;
+            configured = true;
+        }
+
+        float update(float input) {
+            if (!configured) {
+                return input;
+            }
+
+            const float output = (b0 * input) + (b1 * x1) + (b2 * x2) - (a1 * y1) - (a2 * y2);
+            x2 = x1;
+            x1 = input;
+            y2 = y1;
+            y1 = output;
+            return output;
+        }
+
+        void reset(float value = 0.0f) {
+            x1 = value;
+            x2 = value;
+            y1 = value;
+            y2 = value;
+        }
+    };
 }
 
 namespace LED {
@@ -366,6 +458,19 @@ namespace ManualControl {
     }
 }
 
+namespace HoverTest {
+    bool enabled = false;
+    int throttlePercent = 18;
+
+    void setEnabled(bool value) {
+        enabled = value;
+    }
+
+    void setThrottlePercent(int percent) {
+        throttlePercent = constrain(percent, 0, 100);
+    }
+}
+
 namespace PwmTest {
     enum class Mode : uint8_t {
         Off = 0,
@@ -559,6 +664,7 @@ namespace GYRO {
     float pitchDeg = 0.0f;
     float yawDeg = 0.0f;
     float lastDtSeconds = 0.0f;
+    float lastSampleRateHz = 0.0f;
     uint32_t healthCheckStartTimeMs = 0;
     uint32_t nextAutoCalibrationTimeMs = 0;
     uint16_t autoCalibrationAttemptCount = 0;
@@ -585,6 +691,15 @@ namespace GYRO {
     constexpr float kComplementaryAlpha = 0.98f;
     constexpr int16_t kCalibrationGyroSpanLimit = 350;
     constexpr float kCalibrationAccelMagnitudeSpanLimit = 0.18f;
+    Filter::FirstOrder accelFilterX {};
+    Filter::FirstOrder accelFilterY {};
+    Filter::FirstOrder accelFilterZ {};
+    Filter::FirstOrder gyroFilterX {};
+    Filter::FirstOrder gyroFilterY {};
+    Filter::FirstOrder gyroFilterZ {};
+    Filter::BiquadNotch gyroNotchX {};
+    Filter::BiquadNotch gyroNotchY {};
+    Filter::BiquadNotch gyroNotchZ {};
 
     void printPlotterHeader();
     bool isReadyForTelemetry();
@@ -651,7 +766,19 @@ namespace GYRO {
         return true;
     }
 
-    ImuScaledSample scaleSample(const ImuSample &sample) {
+    void resetFilters(const ImuScaledSample &sample) {
+        accelFilterX.reset(sample.accelXG);
+        accelFilterY.reset(sample.accelYG);
+        accelFilterZ.reset(sample.accelZG);
+        gyroFilterX.reset(sample.gyroXDps);
+        gyroFilterY.reset(sample.gyroYDps);
+        gyroFilterZ.reset(sample.gyroZDps);
+        gyroNotchX.reset(sample.gyroXDps);
+        gyroNotchY.reset(sample.gyroYDps);
+        gyroNotchZ.reset(sample.gyroZDps);
+    }
+
+    ImuScaledSample scaleSample(const ImuSample &sample, float dtSeconds) {
         ImuScaledSample scaled {};
         scaled.accelXG = (static_cast<float>(sample.accelX) - accelOffsetX) / kAccelLsbPerG;
         scaled.accelYG = (static_cast<float>(sample.accelY) - accelOffsetY) / kAccelLsbPerG;
@@ -660,6 +787,32 @@ namespace GYRO {
         scaled.gyroYDps = (static_cast<float>(sample.gyroY) - gyroOffsetY) / kGyroLsbPerDps;
         scaled.gyroZDps = (static_cast<float>(sample.gyroZ) - gyroOffsetZ) / kGyroLsbPerDps;
         scaled.temperatureC = static_cast<float>(sample.temperature) / 340.0f + 36.53f;
+
+        if (dtSeconds <= 0.0f || dtSeconds > 0.5f) {
+            resetFilters(scaled);
+            return scaled;
+        }
+
+        if (Config::kEnableGyroNotch) {
+            const float sampleRateHz = 1.0f / dtSeconds;
+            if (fabsf(sampleRateHz - lastSampleRateHz) > 2.0f) {
+                gyroNotchX.configure(sampleRateHz, Config::kGyroNotchCenterHz, Config::kGyroNotchQ);
+                gyroNotchY.configure(sampleRateHz, Config::kGyroNotchCenterHz, Config::kGyroNotchQ);
+                gyroNotchZ.configure(sampleRateHz, Config::kGyroNotchCenterHz, Config::kGyroNotchQ);
+                lastSampleRateHz = sampleRateHz;
+            }
+
+            scaled.gyroXDps = gyroNotchX.update(scaled.gyroXDps);
+            scaled.gyroYDps = gyroNotchY.update(scaled.gyroYDps);
+            scaled.gyroZDps = gyroNotchZ.update(scaled.gyroZDps);
+        }
+
+        scaled.accelXG = accelFilterX.update(scaled.accelXG, dtSeconds, Config::kAccelLowPassHz);
+        scaled.accelYG = accelFilterY.update(scaled.accelYG, dtSeconds, Config::kAccelLowPassHz);
+        scaled.accelZG = accelFilterZ.update(scaled.accelZG, dtSeconds, Config::kAccelLowPassHz);
+        scaled.gyroXDps = gyroFilterX.update(scaled.gyroXDps, dtSeconds, Config::kGyroLowPassHz);
+        scaled.gyroYDps = gyroFilterY.update(scaled.gyroYDps, dtSeconds, Config::kGyroLowPassHz);
+        scaled.gyroZDps = gyroFilterZ.update(scaled.gyroZDps, dtSeconds, Config::kGyroLowPassHz);
         return scaled;
     }
 
@@ -788,6 +941,7 @@ namespace GYRO {
         calibrated = calibrate();
         lastUpdateTimeUs = micros();
         lastDtSeconds = 0.0f;
+        lastSampleRateHz = 0.0f;
         latestScaledSample = {};
         resetHealthCheck();
         if (calibrated) {
@@ -886,7 +1040,7 @@ namespace GYRO {
     }
 
     void printPlotterHeader() {
-        Debug::logf("PLOTTER fields: ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,roll_deg,pitch_deg,yaw_deg,rc1,rc2,rc3,rc4,rc5,pid_roll_out,pid_pitch_out,pid_yaw_out,motor1_us,motor2_us,motor3_us,motor4_us\r\n");
+        Debug::logf("PLOTTER fields: ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,roll_deg,pitch_deg,yaw_deg,rc1,rc2,rc3,rc4,rc5,pid_roll_out,pid_pitch_out,pid_yaw_out,motor1_us,motor2_us,motor3_us,motor4_us,flight_state,armed,failsafe,prearm_ok,rc_link\r\n");
     }
 
     bool isReadyForTelemetry() {
@@ -921,6 +1075,7 @@ namespace GYRO {
 
         if (ready) {
             lastUpdateTimeUs = micros();
+            lastSampleRateHz = 0.0f;
             resetHealthCheck();
             autoCalibrationAttemptCount = 0;
             scheduleAutoCalibration(Config::kImuBootSettleDelayMs);
@@ -947,6 +1102,7 @@ namespace GYRO {
             calibrated = calibrate();
             lastUpdateTimeUs = micros();
             lastDtSeconds = 0.0f;
+            lastSampleRateHz = 0.0f;
             latestScaledSample = {};
             resetHealthCheck();
 
@@ -965,13 +1121,13 @@ namespace GYRO {
 
         ImuSample sample {};
         if (readSample(sample)) {
-            const ImuScaledSample scaled = scaleSample(sample);
             const uint32_t currentTimeUs = micros();
             const float dtSeconds = (lastUpdateTimeUs == 0)
                 ? 0.0f
                 : static_cast<float>(currentTimeUs - lastUpdateTimeUs) / 1000000.0f;
             lastUpdateTimeUs = currentTimeUs;
             lastDtSeconds = dtSeconds;
+            const ImuScaledSample scaled = scaleSample(sample, dtSeconds);
             latestScaledSample = scaled;
 
             updateAttitude(scaled, dtSeconds);
@@ -993,7 +1149,39 @@ namespace ELRS {
     extern int auxPercent;
 }
 
+namespace Flight {
+    enum class State : uint8_t;
+
+    void setup();
+    void loop();
+    void requestArm();
+    void requestDisarm(const char *reason);
+    bool isArmed();
+    bool isFailsafe();
+    bool prearmReady();
+    bool outputsEnabled();
+    bool motorIdleEnabled();
+    int minimumMotorPercent();
+    const char *stateName();
+    State currentState();
+    uint8_t armedFlag();
+    uint8_t failsafeFlag();
+    uint8_t prearmFlag();
+    uint8_t rcLinkFlag();
+}
+
 namespace PID {
+    struct AxisTuning {
+        float angleKp;
+        float angleKi;
+        float rateKp;
+        float rateKi;
+        float rateKd;
+        float angleIntegralLimit;
+        float rateIntegralLimit;
+        float outputLimit;
+    };
+
     struct AxisState {
         float angleTargetDeg = 0.0f;
         float angleMeasurementDeg = 0.0f;
@@ -1011,17 +1199,25 @@ namespace PID {
         float output = 0.0f;
         float rateKp = 0.0f;
         float rateKi = 0.0f;
-        float kp = 0.0f;
-        float kd = 0.0f;
+        float rateKd = 0.0f;
         float lastRateMeasurementDegPerSec = 0.0f;
         float outputLimit = 0.0f;
         float integralLimit = 0.0f;
+        float angleIntegralLimit = 0.0f;
+        Filter::FirstOrder dTermFilter {};
     };
 
     AxisState roll;
     AxisState pitch;
     AxisState yaw;
     uint32_t nextPrintTimeMs = 0;
+    Filter::FirstOrder rcRollFilter {};
+    Filter::FirstOrder rcPitchFilter {};
+    Filter::FirstOrder rcThrottleFilter {};
+    Filter::FirstOrder rcYawFilter {};
+    constexpr AxisTuning kRollTuning = {4.5f, 0.10f, 0.20f, 0.08f, 0.002f, Config::kIntegralLimitAngle, Config::kIntegralLimitRate, Config::kSurfaceOutputLimit};
+    constexpr AxisTuning kPitchTuning = {4.5f, 0.10f, 0.20f, 0.08f, 0.002f, Config::kIntegralLimitAngle, Config::kIntegralLimitRate, Config::kSurfaceOutputLimit};
+    constexpr AxisTuning kYawTuning = {0.0f, 0.0f, 0.18f, 0.05f, 0.001f, Config::kIntegralLimitAngle, Config::kIntegralLimitRate, Config::kYawOutputLimit};
 
     float rcToNormalized(uint16_t rcValue) {
         const float normalized = (static_cast<float>(rcValue) - 1500.0f) / 500.0f;
@@ -1052,6 +1248,7 @@ namespace PID {
         axis.rateDerivative = 0.0f;
         axis.output = 0.0f;
         axis.lastRateMeasurementDegPerSec = axis.rateMeasurementDegPerSec;
+        axis.dTermFilter.reset(0.0f);
     }
 
     void resetAll() {
@@ -1061,29 +1258,32 @@ namespace PID {
     }
 
     void setup() {
-        roll.angleKp = 4.5f;
-        roll.angleKi = 0.1f;
-        roll.rateKp = 0.20f;
-        roll.rateKi = 0.08f;
-        roll.kd = 0.002f;
-        roll.outputLimit = Config::kSurfaceOutputLimit;
-        roll.integralLimit = Config::kIntegralLimitRate;
+        roll.angleKp = kRollTuning.angleKp;
+        roll.angleKi = kRollTuning.angleKi;
+        roll.rateKp = kRollTuning.rateKp;
+        roll.rateKi = kRollTuning.rateKi;
+        roll.rateKd = kRollTuning.rateKd;
+        roll.outputLimit = kRollTuning.outputLimit;
+        roll.integralLimit = kRollTuning.rateIntegralLimit;
+        roll.angleIntegralLimit = kRollTuning.angleIntegralLimit;
 
-        pitch.angleKp = 4.5f;
-        pitch.angleKi = 0.1f;
-        pitch.rateKp = 0.20f;
-        pitch.rateKi = 0.08f;
-        pitch.kd = 0.002f;
-        pitch.outputLimit = Config::kSurfaceOutputLimit;
-        pitch.integralLimit = Config::kIntegralLimitRate;
+        pitch.angleKp = kPitchTuning.angleKp;
+        pitch.angleKi = kPitchTuning.angleKi;
+        pitch.rateKp = kPitchTuning.rateKp;
+        pitch.rateKi = kPitchTuning.rateKi;
+        pitch.rateKd = kPitchTuning.rateKd;
+        pitch.outputLimit = kPitchTuning.outputLimit;
+        pitch.integralLimit = kPitchTuning.rateIntegralLimit;
+        pitch.angleIntegralLimit = kPitchTuning.angleIntegralLimit;
 
-        yaw.angleKp = 0.0f;
-        yaw.angleKi = 0.0f;
-        yaw.rateKp = 0.18f;
-        yaw.rateKi = 0.05f;
-        yaw.kd = 0.001f;
-        yaw.outputLimit = Config::kYawOutputLimit;
-        yaw.integralLimit = Config::kIntegralLimitRate;
+        yaw.angleKp = kYawTuning.angleKp;
+        yaw.angleKi = kYawTuning.angleKi;
+        yaw.rateKp = kYawTuning.rateKp;
+        yaw.rateKi = kYawTuning.rateKi;
+        yaw.rateKd = kYawTuning.rateKd;
+        yaw.outputLimit = kYawTuning.outputLimit;
+        yaw.integralLimit = kYawTuning.rateIntegralLimit;
+        yaw.angleIntegralLimit = kYawTuning.angleIntegralLimit;
         Debug::logf("PID debug framework ready\r\n");
     }
 
@@ -1093,7 +1293,7 @@ namespace PID {
 
         if (dtSeconds > 0.0f && dtSeconds < 0.5f) {
             axis.angleIntegral += axis.angleErrorDeg * dtSeconds;
-            axis.angleIntegral = clampAbs(axis.angleIntegral, Config::kIntegralLimitAngle);
+            axis.angleIntegral = clampAbs(axis.angleIntegral, axis.angleIntegralLimit);
         }
 
         axis.angleOutputRateDegPerSec =
@@ -1108,11 +1308,12 @@ namespace PID {
 
         if (dtSeconds > 0.0f && dtSeconds < 0.5f) {
             const float proposedIntegral = axis.rateIntegral + (axis.rateErrorDegPerSec * dtSeconds);
-            const float derivative = (axis.rateMeasurementDegPerSec - axis.lastRateMeasurementDegPerSec) / dtSeconds;
+            const float rawDerivative = (axis.rateMeasurementDegPerSec - axis.lastRateMeasurementDegPerSec) / dtSeconds;
+            const float derivative = axis.dTermFilter.update(rawDerivative, dtSeconds, Config::kDTermLowPassHz);
             float unclampedOutput =
                 (axis.rateKp * axis.rateErrorDegPerSec) +
                 (axis.rateKi * proposedIntegral) -
-                (axis.kd * derivative);
+                (axis.rateKd * derivative);
 
             if ((unclampedOutput < axis.outputLimit && unclampedOutput > -axis.outputLimit) ||
                 ((unclampedOutput >= axis.outputLimit) && (axis.rateErrorDegPerSec < 0.0f)) ||
@@ -1128,9 +1329,34 @@ namespace PID {
         axis.output =
             (axis.rateKp * axis.rateErrorDegPerSec) +
             (axis.rateKi * axis.rateIntegral) -
-            (axis.kd * axis.rateDerivative);
+            (axis.rateKd * axis.rateDerivative);
         axis.output = clampAbs(axis.output, axis.outputLimit);
         axis.lastRateMeasurementDegPerSec = axis.rateMeasurementDegPerSec;
+    }
+
+    void constrainMixerOutputs(float &motor1, float &motor2, float &motor3, float &motor4, float minPercent, float maxPercent) {
+        float maxValue = max(max(motor1, motor2), max(motor3, motor4));
+        if (maxValue > maxPercent) {
+            const float excess = maxValue - maxPercent;
+            motor1 -= excess;
+            motor2 -= excess;
+            motor3 -= excess;
+            motor4 -= excess;
+        }
+
+        float minValue = min(min(motor1, motor2), min(motor3, motor4));
+        if (minValue < minPercent) {
+            const float deficit = minPercent - minValue;
+            motor1 += deficit;
+            motor2 += deficit;
+            motor3 += deficit;
+            motor4 += deficit;
+        }
+
+        motor1 = constrain(motor1, minPercent, maxPercent);
+        motor2 = constrain(motor2, minPercent, maxPercent);
+        motor3 = constrain(motor3, minPercent, maxPercent);
+        motor4 = constrain(motor4, minPercent, maxPercent);
     }
 
     void applyControlOutputs() {
@@ -1167,8 +1393,35 @@ namespace PID {
             return;
         }
 
-        const int throttlePercent = constrain(ELRS::throttlePercent, 0, 100);
+        if (HoverTest::enabled) {
+            const float rollMix = roll.output;
+            const float pitchMix = pitch.output;
+            const float yawMix = yaw.output;
+            float motor1Percent = static_cast<float>(HoverTest::throttlePercent) + pitchMix + rollMix - yawMix;
+            float motor2Percent = static_cast<float>(HoverTest::throttlePercent) + pitchMix - rollMix + yawMix;
+            float motor3Percent = static_cast<float>(HoverTest::throttlePercent) - pitchMix - rollMix - yawMix;
+            float motor4Percent = static_cast<float>(HoverTest::throttlePercent) - pitchMix + rollMix + yawMix;
+            constrainMixerOutputs(motor1Percent, motor2Percent, motor3Percent, motor4Percent, 0.0f, 100.0f);
+            PWM::setMotorPercents(
+                static_cast<int>(motor1Percent),
+                static_cast<int>(motor2Percent),
+                static_cast<int>(motor3Percent),
+                static_cast<int>(motor4Percent),
+                50
+            );
+            return;
+        }
+
+        if (!Flight::outputsEnabled()) {
+            PWM::setMotorPercents(0, 0, 0, 0, constrain(ELRS::auxPercent, 0, 100));
+            return;
+        }
+
+        int throttlePercent = constrain(ELRS::throttlePercent, 0, 100);
         const int auxPercent = constrain(ELRS::auxPercent, 0, 100);
+        if (Flight::motorIdleEnabled()) {
+            throttlePercent = max(throttlePercent, Flight::minimumMotorPercent());
+        }
         const float rollMix = roll.output;
         const float pitchMix = pitch.output;
         const float yawMix = yaw.output;
@@ -1178,14 +1431,28 @@ namespace PID {
         // M2 = Front Right (CW)
         // M3 = Rear Right  (CCW)
         // M4 = Rear Left   (CW)
-        const int motor1Percent = constrain(static_cast<int>(throttlePercent + pitchMix + rollMix - yawMix), 0, 100);
-        const int motor2Percent = constrain(static_cast<int>(throttlePercent + pitchMix - rollMix + yawMix), 0, 100);
-        const int motor3Percent = constrain(static_cast<int>(throttlePercent - pitchMix - rollMix - yawMix), 0, 100);
-        const int motor4Percent = constrain(static_cast<int>(throttlePercent - pitchMix + rollMix + yawMix), 0, 100);
-        PWM::setMotorPercents(motor1Percent, motor2Percent, motor3Percent, motor4Percent, auxPercent);
+        float motor1Percent = static_cast<float>(throttlePercent) + pitchMix + rollMix - yawMix;
+        float motor2Percent = static_cast<float>(throttlePercent) + pitchMix - rollMix + yawMix;
+        float motor3Percent = static_cast<float>(throttlePercent) - pitchMix - rollMix - yawMix;
+        float motor4Percent = static_cast<float>(throttlePercent) - pitchMix + rollMix + yawMix;
+        constrainMixerOutputs(
+            motor1Percent,
+            motor2Percent,
+            motor3Percent,
+            motor4Percent,
+            static_cast<float>(Flight::minimumMotorPercent()),
+            100.0f
+        );
+        PWM::setMotorPercents(
+            static_cast<int>(motor1Percent),
+            static_cast<int>(motor2Percent),
+            static_cast<int>(motor3Percent),
+            static_cast<int>(motor4Percent),
+            auxPercent
+        );
     }
 
-    void printTelemetry(float yawDeg) {
+    void printTelemetry(float rollDeg, float pitchDeg, float yawDeg) {
         const uint32_t now = millis();
         if (now < nextPrintTimeMs) {
             return;
@@ -1203,9 +1470,9 @@ namespace PID {
         Debug::comma();
         Debug::csvFloat(GYRO::latestScaledSample.gyroZDps, 2);
         Debug::comma();
-        Debug::csvFloat(roll.angleMeasurementDeg, 2);
+        Debug::csvFloat(rollDeg, 2);
         Debug::comma();
-        Debug::csvFloat(pitch.angleMeasurementDeg, 2);
+        Debug::csvFloat(pitchDeg, 2);
         Debug::comma();
         Debug::csvFloat(yawDeg, 2);
         Debug::comma();
@@ -1232,6 +1499,16 @@ namespace PID {
         Debug::csvFloat(static_cast<float>(PWM::lastMotor3Us), 0);
         Debug::comma();
         Debug::csvFloat(static_cast<float>(PWM::lastMotor4Us), 0);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(Flight::currentState()), 0);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(Flight::armedFlag()), 0);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(Flight::failsafeFlag()), 0);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(Flight::prearmFlag()), 0);
+        Debug::comma();
+        Debug::csvFloat(static_cast<float>(Flight::rcLinkFlag()), 0);
         Debug::endLine();
         nextPrintTimeMs = now + Config::kPidPrintIntervalMs;
     }
@@ -1246,7 +1523,7 @@ namespace PID {
             if (GYRO::isReadyForTelemetry()) {
                 roll.angleMeasurementDeg = rollDeg;
                 pitch.angleMeasurementDeg = pitchDeg;
-                printTelemetry(yawDeg);
+                printTelemetry(rollDeg, pitchDeg, yawDeg);
             }
             return;
         }
@@ -1256,8 +1533,30 @@ namespace PID {
             if (GYRO::isReadyForTelemetry()) {
                 roll.angleMeasurementDeg = rollDeg;
                 pitch.angleMeasurementDeg = pitchDeg;
-                printTelemetry(yawDeg);
+                printTelemetry(rollDeg, pitchDeg, yawDeg);
             }
+            return;
+        }
+
+        if (HoverTest::enabled) {
+            if (!GYRO::isReadyForTelemetry()) {
+                resetAll();
+                return;
+            }
+
+            roll.angleTargetDeg = 0.0f;
+            pitch.angleTargetDeg = 0.0f;
+            yaw.rateTargetDegPerSec = 0.0f;
+
+            updateAngleLoop(roll, rollDeg, Config::kMaxRollPitchRateDegPerSec, dtSeconds);
+            updateAngleLoop(pitch, pitchDeg, Config::kMaxRollPitchRateDegPerSec, dtSeconds);
+            roll.rateTargetDegPerSec = roll.angleOutputRateDegPerSec;
+            pitch.rateTargetDegPerSec = pitch.angleOutputRateDegPerSec;
+            updateRateLoop(roll, GYRO::latestScaledSample.gyroXDps, dtSeconds);
+            updateRateLoop(pitch, GYRO::latestScaledSample.gyroYDps, dtSeconds);
+            updateRateLoop(yaw, GYRO::latestScaledSample.gyroZDps, dtSeconds);
+            applyControlOutputs();
+            printTelemetry(rollDeg, pitchDeg, yawDeg);
             return;
         }
 
@@ -1266,10 +1565,25 @@ namespace PID {
             return;
         }
 
+        if (!Flight::isArmed()) {
+            roll.angleTargetDeg = 0.0f;
+            pitch.angleTargetDeg = 0.0f;
+            yaw.rateTargetDegPerSec = 0.0f;
+            resetAll();
+            applyControlOutputs();
+            printTelemetry(rollDeg, pitchDeg, yawDeg);
+            return;
+        }
+
         if (ELRS::signalValid) {
-            const float rollStick = applyDeadband(rcToNormalized(ELRS::rcValues[0]), Config::kStickDeadband);
-            const float pitchStick = applyDeadband(rcToNormalized(ELRS::rcValues[1]), Config::kStickDeadband);
-            const float yawStick = applyDeadband(rcToNormalized(ELRS::rcValues[3]), Config::kStickDeadband);
+            const float filteredRoll = rcRollFilter.update(rcToNormalized(ELRS::rcValues[0]), dtSeconds, Config::kRcSmoothingHz);
+            const float filteredPitch = rcPitchFilter.update(rcToNormalized(ELRS::rcValues[1]), dtSeconds, Config::kRcSmoothingHz);
+            const float filteredThrottle = rcThrottleFilter.update(rcToNormalized(ELRS::rcValues[2]), dtSeconds, Config::kRcSmoothingHz);
+            const float filteredYaw = rcYawFilter.update(rcToNormalized(ELRS::rcValues[3]), dtSeconds, Config::kRcSmoothingHz);
+            const float rollStick = applyDeadband(filteredRoll, Config::kStickDeadband);
+            const float pitchStick = applyDeadband(filteredPitch, Config::kStickDeadband);
+            const float yawStick = applyDeadband(filteredYaw, Config::kStickDeadband);
+            (void)filteredThrottle;
 
             roll.angleTargetDeg = rollStick * Config::kMaxAngleTargetDeg;
             pitch.angleTargetDeg = pitchStick * Config::kMaxAngleTargetDeg;
@@ -1291,7 +1605,7 @@ namespace PID {
         updateRateLoop(pitch, GYRO::latestScaledSample.gyroYDps, dtSeconds);
         updateRateLoop(yaw, GYRO::latestScaledSample.gyroZDps, dtSeconds);
         applyControlOutputs();
-        printTelemetry(yawDeg);
+        printTelemetry(rollDeg, pitchDeg, yawDeg);
     }
 }
 
@@ -1321,11 +1635,25 @@ namespace Command {
             return;
         }
 
+        if (strcmp(line, "ARM") == 0) {
+            Flight::requestArm();
+            Debug::logf("CMD ARM OK\r\n");
+            return;
+        }
+
+        if (strcmp(line, "DISARM") == 0) {
+            Flight::requestDisarm("command");
+            Debug::logf("CMD DISARM OK\r\n");
+            return;
+        }
+
         if (strcmp(line, "MODE AUTO") == 0) {
             RawTimerTest::disable();
             PinTest::setMode(PinTest::Mode::Off);
             ManualControl::setEnabled(false);
+            HoverTest::setEnabled(false);
             PwmTest::setMode(PwmTest::Mode::Off);
+            Flight::requestDisarm("mode_auto");
             Debug::logf("CMD MODE AUTO OK\r\n");
             return;
         }
@@ -1335,8 +1663,21 @@ namespace Command {
             PinTest::setMode(PinTest::Mode::Off);
             PwmTest::setMode(PwmTest::Mode::Off);
             ManualControl::setEnabled(true);
+            HoverTest::setEnabled(false);
             ManualControl::setAllMotorsPercent(0);
+            Flight::requestDisarm("mode_manual");
             Debug::logf("CMD MODE MANUAL OK\r\n");
+            return;
+        }
+
+        if (strcmp(line, "MODE HOVERTEST") == 0) {
+            RawTimerTest::disable();
+            PinTest::setMode(PinTest::Mode::Off);
+            PwmTest::setMode(PwmTest::Mode::Off);
+            ManualControl::setEnabled(false);
+            HoverTest::setEnabled(true);
+            Flight::requestDisarm("mode_hovertest");
+            Debug::logf("CMD MODE HOVERTEST OK throttle=%d\r\n", HoverTest::throttlePercent);
             return;
         }
 
@@ -1344,6 +1685,7 @@ namespace Command {
             RawTimerTest::disable();
             ManualControl::setEnabled(false);
             PwmTest::setMode(PwmTest::Mode::Off);
+            Flight::requestDisarm("pintest_pa0_high");
             PinTest::setMode(PinTest::Mode::Pa0High);
             Debug::logf("CMD PINTEST PA0 HIGH OK\r\n");
             return;
@@ -1353,6 +1695,7 @@ namespace Command {
             RawTimerTest::disable();
             ManualControl::setEnabled(false);
             PwmTest::setMode(PwmTest::Mode::Off);
+            Flight::requestDisarm("pintest_pa0_low");
             PinTest::setMode(PinTest::Mode::Pa0Low);
             Debug::logf("CMD PINTEST PA0 LOW OK\r\n");
             return;
@@ -1362,6 +1705,7 @@ namespace Command {
             RawTimerTest::disable();
             ManualControl::setEnabled(false);
             PwmTest::setMode(PwmTest::Mode::Off);
+            Flight::requestDisarm("pintest_pa0_blink");
             PinTest::setMode(PinTest::Mode::Pa0Blink1Hz);
             Debug::logf("CMD PINTEST PA0 BLINK OK\r\n");
             return;
@@ -1378,6 +1722,7 @@ namespace Command {
             ManualControl::setEnabled(false);
             PinTest::setMode(PinTest::Mode::Off);
             PwmTest::setMode(PwmTest::Mode::RawTim2Ch1Square400Hz);
+            Flight::requestDisarm("raw_tim2_test");
             RawTimerTest::enablePa0Tim2Square400Hz50();
             Debug::logf("CMD PWMTEST RAWTIM2 ON OK\r\n");
             RawTimerTest::logState("PWMTEST RAWTIM2");
@@ -1389,6 +1734,7 @@ namespace Command {
             PinTest::setMode(PinTest::Mode::Off);
             ManualControl::setEnabled(false);
             PwmTest::setMode(PwmTest::Mode::SquareWave400Hz);
+            Flight::requestDisarm("pwm_square_test");
             PWM::setEscSquareDutyAll(PwmTest::dutyPercent);
             Debug::logf("CMD PWMTEST SQUARE ON OK duty=%u\r\n", PwmTest::dutyPercent);
             PWM::logEscTimerState("PWMTEST SQUARE");
@@ -1400,6 +1746,7 @@ namespace Command {
             PinTest::setMode(PinTest::Mode::Off);
             ManualControl::setEnabled(false);
             PwmTest::setMode(PwmTest::Mode::EscPulse400Hz);
+            Flight::requestDisarm("pwm_esc_test");
             PWM::applyEscPulseAll(PwmTest::pulseUs);
             Debug::logf("CMD PWMTEST ESC ON OK pulse=%u\r\n", PwmTest::pulseUs);
             PWM::logEscTimerState("PWMTEST ESC");
@@ -1417,6 +1764,12 @@ namespace Command {
         if (sscanf(line, "THROTTLE %d", &throttlePercent) == 1) {
             ManualControl::setAllMotorsPercent(throttlePercent);
             Debug::logf("CMD THROTTLE %d OK\r\n", ManualControl::masterThrottlePercent);
+            return;
+        }
+
+        if (sscanf(line, "HOVERTHROTTLE %d", &throttlePercent) == 1) {
+            HoverTest::setThrottlePercent(throttlePercent);
+            Debug::logf("CMD HOVERTHROTTLE %d OK\r\n", HoverTest::throttlePercent);
             return;
         }
 
@@ -1545,6 +1898,173 @@ namespace ELRS {
             throttlePercent = 0;
             yawPercent = 50;
             auxPercent = 50;
+            Debug::logf("RC timeout detected, signal marked invalid\r\n");
+        }
+    }
+}
+
+namespace Flight {
+    enum class State : uint8_t {
+        Booting = 0,
+        Disarmed = 1,
+        Armed = 2,
+        Failsafe = 3,
+    };
+
+    State state = State::Booting;
+    bool armRequested = false;
+    bool prearmOk = false;
+    bool rcLinkOk = false;
+    uint32_t stateEntryTimeMs = 0;
+
+    const char *stateName(State value) {
+        switch (value) {
+            case State::Booting:
+                return "BOOT";
+            case State::Disarmed:
+                return "DISARMED";
+            case State::Armed:
+                return "ARMED";
+            case State::Failsafe:
+                return "FAILSAFE";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    const char *stateName() {
+        return stateName(state);
+    }
+
+    State currentState() {
+        return state;
+    }
+
+    bool throttleLowForArm() {
+        return ELRS::throttlePercent <= Config::kArmThrottleMaxPercent;
+    }
+
+    bool prearmReady() {
+        return prearmOk;
+    }
+
+    bool isArmed() {
+        return state == State::Armed;
+    }
+
+    bool isFailsafe() {
+        return state == State::Failsafe;
+    }
+
+    bool outputsEnabled() {
+        return state == State::Armed;
+    }
+
+    bool motorIdleEnabled() {
+        return state == State::Armed;
+    }
+
+    int minimumMotorPercent() {
+        return (state == State::Armed) ? Config::kMotorIdlePercent : Config::kMotorOutputMinPercent;
+    }
+
+    uint8_t armedFlag() {
+        return isArmed() ? 1U : 0U;
+    }
+
+    uint8_t failsafeFlag() {
+        return isFailsafe() ? 1U : 0U;
+    }
+
+    uint8_t prearmFlag() {
+        return prearmOk ? 1U : 0U;
+    }
+
+    uint8_t rcLinkFlag() {
+        return rcLinkOk ? 1U : 0U;
+    }
+
+    void enterState(State nextState, const char *reason) {
+        if (state == nextState) {
+            return;
+        }
+
+        state = nextState;
+        stateEntryTimeMs = millis();
+        Debug::logf("FLIGHT state=%s reason=%s\r\n", stateName(state), (reason != nullptr) ? reason : "none");
+    }
+
+    void requestArm() {
+        armRequested = true;
+        Debug::logf("FLIGHT arm request queued\r\n");
+    }
+
+    void requestDisarm(const char *reason) {
+        armRequested = false;
+        enterState(State::Disarmed, (reason != nullptr) ? reason : "disarm_request");
+    }
+
+    void setup() {
+        state = State::Booting;
+        stateEntryTimeMs = millis();
+        prearmOk = false;
+        rcLinkOk = false;
+        armRequested = false;
+        Debug::logf("FLIGHT state=%s reason=boot\r\n", stateName(state));
+    }
+
+    void loop() {
+        rcLinkOk = ELRS::signalValid;
+        prearmOk =
+            GYRO::isReadyForTelemetry() &&
+            rcLinkOk &&
+            throttleLowForArm() &&
+            (PinTest::mode == PinTest::Mode::Off) &&
+            (PwmTest::mode == PwmTest::Mode::Off) &&
+            !RawTimerTest::enabled &&
+            !ManualControl::enabled;
+
+        const uint32_t now = millis();
+        if (state == State::Booting) {
+            if ((now - stateEntryTimeMs) >= Config::kBootStateMinMs && GYRO::isReadyForTelemetry()) {
+                enterState(State::Disarmed, "boot_complete");
+            }
+            return;
+        }
+
+        if (armRequested && state == State::Disarmed) {
+            if (prearmOk) {
+                enterState(State::Armed, "arm_command");
+            } else {
+                Debug::logf(
+                    "FLIGHT arm denied prearm=%d imu=%d rc=%d throttleLow=%d tests=%d manual=%d\r\n",
+                    prearmOk ? 1 : 0,
+                    GYRO::isReadyForTelemetry() ? 1 : 0,
+                    rcLinkOk ? 1 : 0,
+                    throttleLowForArm() ? 1 : 0,
+                    ((PinTest::mode == PinTest::Mode::Off) && (PwmTest::mode == PwmTest::Mode::Off) && !RawTimerTest::enabled) ? 0 : 1,
+                    ManualControl::enabled ? 1 : 0
+                );
+            }
+            armRequested = false;
+        }
+
+        if (state == State::Armed) {
+            if (!GYRO::isReadyForTelemetry()) {
+                enterState(State::Failsafe, "imu_not_ready");
+                return;
+            }
+
+            if (!rcLinkOk) {
+                enterState(State::Failsafe, "rc_timeout");
+                return;
+            }
+        }
+
+        if (state == State::Failsafe) {
+            if ((now - stateEntryTimeMs) >= Config::kFailsafeDisarmDelayMs) {
+                requestDisarm("failsafe_timeout");
+            }
         }
     }
 }
@@ -1562,6 +2082,7 @@ void setup() {
     GYRO::setup();
     PID::setup();
     ELRS::setup();
+    Flight::setup();
 }
 
 void loop() {
@@ -1570,5 +2091,6 @@ void loop() {
     LED::loop();
     GYRO::loop();
     ELRS::loop();
+    Flight::loop();
     PID::loop(GYRO::rollDeg, GYRO::pitchDeg, GYRO::yawDeg, GYRO::lastDtSeconds);
 }
