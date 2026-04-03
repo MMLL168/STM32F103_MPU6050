@@ -1,5 +1,6 @@
 ﻿import csv
 import math
+import re
 import queue
 import threading
 import time
@@ -7,7 +8,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import os
+
+os.environ.setdefault("LANG", "C.UTF-8")
+os.environ.setdefault("LC_ALL", "C.UTF-8")
+
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, ttk
 
 import serial
@@ -41,6 +48,28 @@ CSV_FIELD_NAMES = [
     "prearm_ok",
     "rc_link",
 ]
+
+
+def pick_font_family(root: tk.Misc, candidates: list[str], fallback: str) -> str:
+    available_fonts = set(tkfont.families(root))
+    for family in candidates:
+        if family in available_fonts:
+            return family
+    return fallback
+
+
+ESCAPED_UNICODE_PATTERN = re.compile(r"(\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}|\\U[0-9a-fA-F]{8})")
+
+
+def decode_escaped_text(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    if not ESCAPED_UNICODE_PATTERN.search(text):
+        return text
+    try:
+        return text.encode("utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return text
 
 
 @dataclass
@@ -88,7 +117,7 @@ class SerialReader(threading.Thread):
     def run(self) -> None:
         try:
             self.serial_handle = serial.Serial(self.port, self.baudrate, timeout=0.2)
-            self.output_queue.put(("status", f"已連線到 {self.port} @ {self.baudrate}"))
+            self.output_queue.put(("status", f"Connected to {self.port} @ {self.baudrate}"))
 
             while not self.stop_event.is_set():
                 raw_line = self.serial_handle.readline()
@@ -101,7 +130,7 @@ class SerialReader(threading.Thread):
                 self.output_queue.put(("line", line))
 
         except Exception as exc:  # noqa: BLE001
-            self.output_queue.put(("status", f"序列埠錯誤: {exc}"))
+            self.output_queue.put(("status", f"Serial error: {exc}"))
         finally:
             if self.serial_handle is not None and self.serial_handle.is_open:
                 self.serial_handle.close()
@@ -122,17 +151,18 @@ class SerialReader(threading.Thread):
 
 
 class HorizonWidget(tk.Canvas):
-    def __init__(self, master):
-        super().__init__(master, width=300, height=220, bg="#0f172a", highlightthickness=0)
+    def __init__(self, master, mono_font_family: str = "TkFixedFont"):
+        super().__init__(master, width=280, height=210, bg="#0f172a", highlightthickness=0)
         self.center_x = 180.0
         self.center_y = 180.0
         self.radius = 150.0
+        self.mono_font_family = mono_font_family
 
     def redraw(self, roll_deg: float, pitch_deg: float, yaw_deg: float) -> None:
         self.delete("all")
 
-        canvas_width = max(self.winfo_width(), 360)
-        canvas_height = max(self.winfo_height(), 360)
+        canvas_width = max(self.winfo_width(), 280)
+        canvas_height = max(self.winfo_height(), 210)
         self.center_x = canvas_width / 2.0
         self.center_y = canvas_height / 2.0
         self.radius = min(canvas_width, canvas_height) * 0.42
@@ -217,22 +247,31 @@ class HorizonWidget(tk.Canvas):
             24,
             text=f"Roll {roll_deg:6.2f} deg   Pitch {pitch_deg:6.2f} deg   Yaw {yaw_deg:6.2f} deg",
             fill="#f8fafc",
-            font=("Consolas", 12, "bold"),
+            font=(self.mono_font_family, 12, "bold"),
         )
 
 
 class StickWidget(tk.Canvas):
-    def __init__(self, master, title: str, x_label: str, y_label: str, throttle_mode: bool = False):
-        super().__init__(master, width=170, height=150, bg="#0f172a", highlightthickness=0)
+    def __init__(
+        self,
+        master,
+        title: str,
+        x_label: str,
+        y_label: str,
+        throttle_mode: bool = False,
+        mono_font_family: str = "TkFixedFont",
+    ):
+        super().__init__(master, width=130, height=120, bg="#0f172a", highlightthickness=0)
         self.title = title
         self.x_label = x_label
         self.y_label = y_label
         self.throttle_mode = throttle_mode
+        self.mono_font_family = mono_font_family
 
     def redraw(self, x_percent: float, y_percent: float) -> None:
         self.delete("all")
 
-        width = max(self.winfo_width(), 140)
+        width = max(self.winfo_width(), 130)
         height = max(self.winfo_height(), 120)
         pad_x = 14
         pad_top = 22
@@ -242,7 +281,7 @@ class StickWidget(tk.Canvas):
         box_right = width - pad_x
         box_bottom = height - pad_bottom
 
-        self.create_text(width / 2, 12, text=self.title, fill="#f8fafc", font=("Consolas", 10, "bold"))
+        self.create_text(width / 2, 12, text=self.title, fill="#f8fafc", font=(self.mono_font_family, 10, "bold"))
         self.create_rectangle(box_left, box_top, box_right, box_bottom, outline="#94a3b8", width=2)
 
         center_x = (box_left + box_right) / 2
@@ -261,14 +300,21 @@ class StickWidget(tk.Canvas):
         knob_x = center_x + normalized_x * ((box_right - box_left) / 2)
 
         self.create_oval(knob_x - 14, knob_y - 14, knob_x + 14, knob_y + 14, fill="#38bdf8", outline="#e2e8f0", width=2)
-        self.create_text(center_x, box_bottom + 8, text=f"{self.x_label}: {x_percent:4.1f}%  {self.y_label}: {y_percent:4.1f}%", fill="#cbd5e1", font=("Consolas", 8))
+        self.create_text(
+            center_x,
+            box_bottom + 8,
+            text=f"{self.x_label}: {x_percent:4.1f}%  {self.y_label}: {y_percent:4.1f}%",
+            fill="#cbd5e1",
+            font=(self.mono_font_family, 8),
+        )
 
 
 class TelemetryApp:
     def __init__(self, root: tk.Tk):
         self.root = root
+        self._configure_platform_fonts()
         self.root.title("Flight Controller Telemetry")
-        self.root.geometry("920x620")
+        self.root.geometry("880x600")
         self.root.minsize(640, 480)
         self.root.configure(bg="#111827")
 
@@ -280,9 +326,9 @@ class TelemetryApp:
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="57600")
-        self.connection_var = tk.StringVar(value="尚未連線")
-        self.last_update_var = tk.StringVar(value="等待 IMU/遙測資料")
-        self.csv_path_var = tk.StringVar(value="未啟用 CSV 記錄")
+        self.connection_var = tk.StringVar(value=self._safe_text("Disconnected"))
+        self.last_update_var = tk.StringVar(value=self._safe_text("Waiting for IMU / telemetry"))
+        self.csv_path_var = tk.StringVar(value=self._safe_text("CSV logging disabled"))
         self.control_mode_var = tk.StringVar(value="auto")
         self.manual_throttle_var = tk.IntVar(value=0)
         self.manual_motor_vars = [tk.IntVar(value=0) for _ in range(4)]
@@ -301,6 +347,90 @@ class TelemetryApp:
         self.root.bind("<Configure>", self.on_root_resize)
         self.root.after(50, self.process_queue)
         self.root.after(500, self.update_freshness)
+        self._normalize_stringvars()
+        self._normalize_widget_tree(self.root)
+
+    def _normalize_stringvars(self) -> None:
+        for variable in [self.connection_var, self.last_update_var, self.csv_path_var]:
+            variable.set(decode_escaped_text(variable.get()))
+
+    def _normalize_widget_tree(self, widget: tk.Misc) -> None:
+        try:
+            current_text = widget.cget("text")
+        except tk.TclError:
+            current_text = None
+
+        if isinstance(current_text, str):
+            normalized_text = decode_escaped_text(current_text)
+            if normalized_text != current_text:
+                try:
+                    widget.configure(text=normalized_text)
+                except tk.TclError:
+                    pass
+
+        try:
+            for child in widget.winfo_children():
+                self._normalize_widget_tree(child)
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _safe_text(text: str) -> str:
+        return decode_escaped_text(text)
+
+    def _set_text_var(self, variable: tk.StringVar, text: str) -> None:
+        variable.set(self._safe_text(text))
+
+    def _configure_platform_fonts(self) -> None:
+        try:
+            self.root.tk.call("encoding", "system", "utf-8")
+        except tk.TclError:
+            pass
+
+        self.ui_font_family = pick_font_family(
+            self.root,
+            [
+                "Noto Sans CJK TC",
+                "Noto Sans TC",
+                "Noto Sans CJK SC",
+                "Noto Sans",
+                "Microsoft JhengHei",
+                "PingFang TC",
+                "WenQuanYi Zen Hei",
+                "AR PL UMing TW",
+                "DejaVu Sans",
+            ],
+            "TkDefaultFont",
+        )
+        self.mono_font_family = pick_font_family(
+            self.root,
+            [
+                "Noto Sans Mono CJK TC",
+                "Noto Sans Mono",
+                "Sarasa Mono TC",
+                "Microsoft JhengHei UI",
+                "DejaVu Sans Mono",
+                "Liberation Mono",
+                "TkFixedFont",
+            ],
+            "TkFixedFont",
+        )
+
+        self.root.option_add("*Font", (self.ui_font_family, 10))
+        self.root.option_add("*TCombobox*Listbox*Font", (self.ui_font_family, 10))
+
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", font=(self.ui_font_family, 10))
+        style.configure("TLabelframe.Label", font=(self.ui_font_family, 10))
+        style.configure("TButton", font=(self.ui_font_family, 10))
+        style.configure("TRadiobutton", font=(self.ui_font_family, 10))
+        style.configure("TLabel", font=(self.ui_font_family, 10))
+        style.configure("TEntry", font=(self.ui_font_family, 10))
+        style.configure("TCombobox", font=(self.ui_font_family, 10))
 
     def _build_layout(self) -> None:
         outer = ttk.Frame(self.root)
@@ -326,21 +456,21 @@ class TelemetryApp:
         top_bar_2 = ttk.Frame(self.main_frame, padding=(6, 0, 6, 2))
         top_bar_2.pack(fill=tk.X)
 
-        ttk.Button(top_bar, text="重新整理埠", command=self.refresh_ports).pack(side=tk.LEFT)
+        ttk.Button(top_bar, text="Refresh Ports", command=self.refresh_ports).pack(side=tk.LEFT)
         self.port_combo = ttk.Combobox(top_bar, textvariable=self.port_var, width=10, state="readonly")
         self.port_combo.pack(side=tk.LEFT, padx=4)
         ttk.Label(top_bar, text="Baud").pack(side=tk.LEFT)
         ttk.Entry(top_bar, textvariable=self.baud_var, width=7).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top_bar, text="連線", command=self.connect).pack(side=tk.LEFT)
-        ttk.Button(top_bar, text="中斷", command=self.disconnect).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top_bar, text="校正 IMU", command=self.calibrate_imu).pack(side=tk.LEFT)
-        ttk.Button(top_bar, text="重置 Yaw", command=self.reset_yaw).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top_bar, text="Connect", command=self.connect).pack(side=tk.LEFT)
+        ttk.Button(top_bar, text="Disconnect", command=self.disconnect).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top_bar, text="Calibrate IMU", command=self.calibrate_imu).pack(side=tk.LEFT)
+        ttk.Button(top_bar, text="Reset Yaw", command=self.reset_yaw).pack(side=tk.LEFT, padx=4)
         ttk.Button(top_bar, text="ARM", command=self.arm_flight).pack(side=tk.LEFT)
         ttk.Button(top_bar, text="DISARM", command=self.disarm_flight).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Label(top_bar, textvariable=self.connection_var).pack(side=tk.LEFT, padx=8)
         ttk.Label(top_bar, textvariable=self.last_update_var).pack(side=tk.RIGHT)
 
-        ttk.Button(top_bar_2, text="方波400 ON", command=self.enable_pwm_square_test).pack(side=tk.LEFT)
+        ttk.Button(top_bar_2, text="Square400 ON", command=self.enable_pwm_square_test).pack(side=tk.LEFT)
         ttk.Button(top_bar_2, text="RAW TIM2", command=self.enable_raw_tim2_test).pack(side=tk.LEFT, padx=4)
         ttk.Button(top_bar_2, text="ESC400 ON", command=self.enable_pwm_esc_test).pack(side=tk.LEFT, padx=4)
         ttk.Button(top_bar_2, text="PWM OFF", command=self.disable_pwm_test).pack(side=tk.LEFT, padx=4)
@@ -352,17 +482,17 @@ class TelemetryApp:
         ttk.Entry(top_bar_2, textvariable=self.pwm_test_duty_var, width=4).pack(side=tk.LEFT, padx=4)
         ttk.Label(top_bar_2, text="us").pack(side=tk.LEFT)
         ttk.Entry(top_bar_2, textvariable=self.pwm_test_pulse_var, width=5).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top_bar_2, text="開始 CSV", command=self.start_csv_logging).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(top_bar_2, text="停止 CSV", command=self.stop_csv_logging).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top_bar_2, text="Start CSV", command=self.start_csv_logging).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top_bar_2, text="Stop CSV", command=self.stop_csv_logging).pack(side=tk.LEFT, padx=4)
 
         csv_bar = ttk.Frame(self.main_frame, padding=(6, 0, 6, 6))
         csv_bar.pack(fill=tk.X)
         ttk.Label(csv_bar, text="CSV:").pack(side=tk.LEFT)
         ttk.Label(csv_bar, textvariable=self.csv_path_var).pack(side=tk.LEFT, padx=8)
-        ttk.Label(csv_bar, text="模式:").pack(side=tk.LEFT, padx=(20, 4))
-        ttk.Radiobutton(csv_bar, text="自動", value="auto", variable=self.control_mode_var, command=self.on_control_mode_changed).pack(side=tk.LEFT)
-        ttk.Radiobutton(csv_bar, text="手動", value="manual", variable=self.control_mode_var, command=self.on_control_mode_changed).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Radiobutton(csv_bar, text="懸停測試", value="hover_test", variable=self.control_mode_var, command=self.on_control_mode_changed).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(csv_bar, text="Mode:").pack(side=tk.LEFT, padx=(20, 4))
+        ttk.Radiobutton(csv_bar, text="Auto", value="auto", variable=self.control_mode_var, command=self.on_control_mode_changed).pack(side=tk.LEFT)
+        ttk.Radiobutton(csv_bar, text="Manual", value="manual", variable=self.control_mode_var, command=self.on_control_mode_changed).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Radiobutton(csv_bar, text="Hover Test", value="hover_test", variable=self.control_mode_var, command=self.on_control_mode_changed).pack(side=tk.LEFT, padx=(4, 0))
 
         content = ttk.Frame(self.main_frame, padding=6)
         content.pack(fill=tk.BOTH, expand=True)
@@ -374,12 +504,12 @@ class TelemetryApp:
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         left.rowconfigure(1, weight=1)
 
-        self.horizon = HorizonWidget(left)
+        self.horizon = HorizonWidget(left, mono_font_family=self.mono_font_family)
         self.horizon.pack(fill=tk.BOTH, expand=True)
 
         log_frame = ttk.Frame(left)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-        self.log_text = tk.Text(log_frame, height=10, bg="#020617", fg="#e2e8f0", font=("Consolas", 9))
+        self.log_text = tk.Text(log_frame, height=10, bg="#020617", fg="#e2e8f0", font=(self.mono_font_family, 9))
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -389,12 +519,46 @@ class TelemetryApp:
         right = ttk.Frame(content)
         right.grid(row=0, column=1, sticky="nsew")
 
+        radio = ttk.LabelFrame(right, text="Transmitter View", padding=6)
+        radio.pack(fill=tk.X, pady=(0, 5))
+        radio.columnconfigure(0, weight=1)
+        radio.columnconfigure(1, weight=1)
+        radio.rowconfigure(1, weight=1)
+        radio.rowconfigure(2, weight=0)
+        self.radio_panel = radio
+        ttk.Label(
+            radio,
+            text="Quad X mapping: rc1=Roll  rc2=Pitch  rc3=Throttle  rc4=Yaw",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        self.left_stick = StickWidget(radio, "Left Stick", "Yaw", "Throttle", throttle_mode=True, mono_font_family=self.mono_font_family)
+        self.left_stick.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        self.right_stick = StickWidget(radio, "Right Stick", "Roll", "Pitch", mono_font_family=self.mono_font_family)
+        self.right_stick.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+
+        mixer_frame = ttk.Frame(radio)
+        mixer_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        mixer_frame.columnconfigure(0, weight=1)
+        self.mixer_frame = mixer_frame
+        ttk.Label(mixer_frame, text="Quad X Mixer", font=(self.mono_font_family, 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            mixer_frame,
+            text=(
+                "M1 Front Left  = Throttle + Pitch + Roll - Yaw\n"
+                "M2 Front Right = Throttle + Pitch - Roll + Yaw\n"
+                "M3 Rear Right  = Throttle - Pitch - Roll - Yaw\n"
+                "M4 Rear Left   = Throttle - Pitch + Roll + Yaw"
+            ),
+            justify=tk.LEFT,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
         top_controls = ttk.Frame(right)
         top_controls.pack(fill=tk.X)
         top_controls.columnconfigure(0, weight=1)
         top_controls.columnconfigure(1, weight=1)
+        self.top_controls = top_controls
 
-        self.manual_frame = ttk.LabelFrame(top_controls, text="四馬達手動油門 Debug", padding=6)
+        self.manual_frame = ttk.LabelFrame(top_controls, text="4-Motor Manual Debug", padding=6)
         self.manual_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 5))
         self.manual_frame.columnconfigure(0, weight=1)
         self.manual_mode_label = ttk.Label(self.manual_frame, text="AUTO")
@@ -406,7 +570,7 @@ class TelemetryApp:
 
         common_frame = ttk.Frame(self.manual_sliders_frame)
         common_frame.grid(row=0, column=0, padx=(0, 6), sticky="n")
-        ttk.Label(common_frame, text="共同").pack()
+        ttk.Label(common_frame, text="All").pack()
         self.manual_throttle_scale = tk.Scale(
             common_frame,
             from_=100,
@@ -470,17 +634,17 @@ class TelemetryApp:
             label = ttk.Label(motor_frame, text="0%\n1000us", justify=tk.CENTER)
             label.pack(pady=(4, 0))
             self.manual_motor_value_labels.append(label)
-        self.manual_hint_label = ttk.Label(self.manual_frame, text="共同滑桿會同步設定 M1~M4；也可個別微調。", wraplength=220, justify=tk.LEFT)
+        self.manual_hint_label = ttk.Label(self.manual_frame, text="The All slider updates M1-M4 together. You can still fine-tune each motor individually.", wraplength=220, justify=tk.LEFT)
         self.manual_hint_label.pack(pady=(6, 0), anchor="w")
 
-        self.hover_frame = ttk.LabelFrame(top_controls, text="懸停穩定測試", padding=6)
+        self.hover_frame = ttk.LabelFrame(top_controls, text="Hover Stabilize Test", padding=6)
         self.hover_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 5))
-        ttk.Label(self.hover_frame, text="固定油門 + 自動水平修正，適合台架驗證，不可直接裝槳暴力測試。", justify=tk.LEFT).pack(anchor="w")
+        ttk.Label(self.hover_frame, text="Fixed throttle plus auto-level correction. Bench test only. Do not install props for aggressive testing.", justify=tk.LEFT).pack(anchor="w")
         self.hover_mode_label = ttk.Label(self.hover_frame, text="AUTO")
         self.hover_mode_label.pack(anchor="w", pady=(6, 4))
         hover_controls = ttk.Frame(self.hover_frame)
         hover_controls.pack(fill=tk.X, expand=True)
-        ttk.Label(hover_controls, text="懸停基準油門").pack(side=tk.LEFT)
+        ttk.Label(hover_controls, text="Hover base throttle").pack(side=tk.LEFT)
         hover_slider_frame = ttk.Frame(hover_controls)
         hover_slider_frame.pack(side=tk.LEFT, padx=(12, 10), anchor="n")
         self.hover_throttle_scale = tk.Scale(
@@ -514,18 +678,18 @@ class TelemetryApp:
         hover_info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, anchor="n")
         ttk.Label(
             hover_info_frame,
-            text="這個模式會把 Roll/Pitch/Yaw 目標設成 0，讓板子歪斜時自動修正四顆馬達。",
+            text="This mode sets Roll/Pitch/Yaw targets to 0 so the controller automatically corrects tilt with the four motors.",
             wraplength=220,
             justify=tk.LEFT,
         ).pack(anchor="w")
         ttk.Label(
             hover_info_frame,
             text=(
-                "懸停測試判讀:\n"
-                "右邊壓低 -> M1/M4 增, M2/M3 減\n"
-                "左邊壓低 -> M2/M3 增, M1/M4 減\n"
-                "機頭壓低 -> M1/M2 增, M3/M4 減\n"
-                "機尾壓低 -> M3/M4 增, M1/M2 減"
+                "Hover test guide:\n"
+                "Right side low -> M1/M4 up, M2/M3 down\n"
+                "Left side low -> M2/M3 up, M1/M4 down\n"
+                "Nose low -> M1/M2 up, M3/M4 down\n"
+                "Tail low -> M3/M4 up, M1/M2 down"
             ),
             wraplength=220,
             justify=tk.LEFT,
@@ -533,67 +697,41 @@ class TelemetryApp:
 
         info_row = ttk.Frame(right)
         info_row.pack(fill=tk.X, pady=(0, 5))
-        for column in range(4):
-            info_row.columnconfigure(column, weight=1)
+        info_row.columnconfigure(0, weight=1)
+        info_row.columnconfigure(1, weight=1)
+        info_row.columnconfigure(2, weight=1)
+        info_row.columnconfigure(3, weight=1)
+        self.info_row = info_row
 
-        self._add_group(
+        self.motor_pwm_group = self._add_group(
             info_row,
-            "輸出 PWM",
+            "Motor PWM",
             ["motor1_us", "motor2_us", "motor3_us", "motor4_us"],
             0,
             0,
         )
-        self._add_group(
+        self.imu_group = self._add_group(
             info_row,
             "IMU",
             ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps", "roll_deg", "pitch_deg", "yaw_deg"],
             0,
             1,
         )
-        self._add_group(info_row, "RC 原始輸入", ["rc1", "rc2", "rc3", "rc4", "rc5"], 0, 2)
+        self.raw_rc_group = self._add_group(info_row, "Raw RC Input", ["rc1", "rc2", "rc3", "rc4", "rc5"], 1, 0)
         status_stack = ttk.Frame(info_row)
-        status_stack.grid(row=0, column=3, sticky="new", padx=5, pady=5)
+        status_stack.grid(row=1, column=1, sticky="new", padx=5, pady=5)
         status_stack.columnconfigure(0, weight=1)
-        self._add_group(status_stack, "PID", ["pid_roll_out", "pid_pitch_out", "pid_yaw_out"], 0, 0)
-        self._add_group(status_stack, "飛控狀態", ["flight_state", "armed", "failsafe", "prearm_ok", "rc_link"], 1, 0)
-
-        radio = ttk.LabelFrame(right, text="遙控器控制面板", padding=6)
-        radio.pack(fill=tk.BOTH, expand=True)
-        radio.columnconfigure(0, weight=1)
-        radio.columnconfigure(1, weight=1)
-        radio.rowconfigure(1, weight=1)
-        radio.rowconfigure(2, weight=0)
-        self.radio_panel = radio
-        ttk.Label(
-            radio,
-            text="Quad X 控制量: rc1=Roll  rc2=Pitch  rc3=Throttle  rc4=Yaw",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-
-        self.left_stick = StickWidget(radio, "左搖桿", "Yaw", "Throttle", throttle_mode=True)
-        self.left_stick.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
-        self.right_stick = StickWidget(radio, "右搖桿", "Roll", "Pitch")
-        self.right_stick.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
-
-        mixer_frame = ttk.Frame(radio)
-        mixer_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        mixer_frame.columnconfigure(0, weight=1)
-        ttk.Label(mixer_frame, text="Quad X Mixer 對照", font=("Consolas", 10, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            mixer_frame,
-            text=(
-                "M1 Front Left  = Throttle + Pitch + Roll - Yaw\n"
-                "M2 Front Right = Throttle + Pitch - Roll + Yaw\n"
-                "M3 Rear Right  = Throttle - Pitch - Roll - Yaw\n"
-                "M4 Rear Left   = Throttle - Pitch + Roll + Yaw"
-            ),
-            justify=tk.LEFT,
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        status_stack.columnconfigure(1, weight=1)
+        self.status_stack = status_stack
+        self.pid_group = self._add_group(status_stack, "PID", ["pid_roll_out", "pid_pitch_out", "pid_yaw_out"], 0, 0)
+        self.flight_state_group = self._add_group(status_stack, "Flight State", ["flight_state", "armed", "failsafe", "prearm_ok", "rc_link"], 0, 1)
     def _add_group(self, master, title: str, fields: list[str], row: int, column: int, columnspan: int = 1) -> None:
         frame = ttk.LabelFrame(master, text=title, padding=8)
         frame.grid(row=row, column=column, columnspan=columnspan, sticky="new", padx=5, pady=5)
         for idx, field_name in enumerate(fields):
             ttk.Label(frame, text=field_name).grid(row=idx, column=0, sticky="w")
-            ttk.Label(frame, textvariable=self.value_vars[field_name], font=("Consolas", 11)).grid(row=idx, column=1, sticky="e", padx=(12, 0))
+            ttk.Label(frame, textvariable=self.value_vars[field_name], font=(self.mono_font_family, 11)).grid(row=idx, column=1, sticky="e", padx=(12, 0))
+        return frame
 
     def reset_telemetry_view(self) -> None:
         self.telemetry = TelemetryState()
@@ -620,89 +758,89 @@ class TelemetryApp:
     def connect(self) -> None:
         self.disconnect()
         if not self.port_var.get():
-            self.connection_var.set("請先選擇 COM 埠")
+            self._set_text_var(self.connection_var, "Please select a serial port")
             return
 
         try:
             baudrate = int(self.baud_var.get())
         except ValueError:
-            self.connection_var.set("Baud rate 格式錯誤")
+            self._set_text_var(self.connection_var, "Invalid baud rate")
             return
 
         self.reset_telemetry_view()
-        self.last_update_var.set("等待 IMU/遙測資料")
+        self._set_text_var(self.last_update_var, "Waiting for IMU / telemetry")
         self.reader = SerialReader(self.port_var.get(), baudrate, self.message_queue)
         self.reader.start()
-        self.connection_var.set(f"連線中 {self.port_var.get()} ...")
+        self._set_text_var(self.connection_var, f"Connecting {self.port_var.get()} ...")
 
     def disconnect(self) -> None:
         if self.reader is not None:
             self.reader.stop()
             self.reader = None
-        self.connection_var.set("尚未連線")
-        self.last_update_var.set("等待 IMU/遙測資料")
+        self._set_text_var(self.connection_var, "Disconnected")
+        self._set_text_var(self.last_update_var, "Waiting for IMU / telemetry")
         self.control_mode_var.set("auto")
         self.update_manual_controls()
         self.reset_telemetry_view()
 
     def send_command(self, command: str, description: str) -> None:
         if self.reader is None or not self.reader.send_command(command):
-            self.append_log(f"無法送出命令: {description}，請先連線")
+            self.append_log(f"Cannot send command: {description}. Connect first.")
             return
 
         self.append_log(f">>> {command}")
 
     def calibrate_imu(self) -> None:
-        self.last_update_var.set("IMU 校正中，請保持靜止")
-        self.send_command("CALIBRATE", "校正 IMU")
+        self._set_text_var(self.last_update_var, "IMU calibration in progress. Keep the board still.")
+        self.send_command("CALIBRATE", "Calibrate IMU")
 
     def reset_yaw(self) -> None:
-        self.send_command("RESET_YAW", "重置 Yaw")
+        self.send_command("RESET_YAW", "Reset Yaw")
 
     def arm_flight(self) -> None:
-        self.send_command("ARM", "飛控 ARM")
+        self.send_command("ARM", "ARM flight controller")
 
     def disarm_flight(self) -> None:
-        self.send_command("DISARM", "飛控 DISARM")
+        self.send_command("DISARM", "DISARM flight controller")
 
     def enable_pwm_square_test(self) -> None:
         duty_percent = max(0, min(100, self.pwm_test_duty_var.get()))
         self.pwm_test_duty_var.set(duty_percent)
-        self.send_command(f"PWMTESTDUTY {duty_percent}", "設定 PWM400 方波 Duty")
-        self.send_command("PWMTEST SQUARE ON", "啟用 PWM400 方波測試模式")
+        self.send_command(f"PWMTESTDUTY {duty_percent}", "Set PWM400 square-wave duty")
+        self.send_command("PWMTEST SQUARE ON", "Enable PWM400 square-wave test")
 
     def enable_pwm_esc_test(self) -> None:
         pulse_us = max(1000, min(2000, self.pwm_test_pulse_var.get()))
         self.pwm_test_pulse_var.set(pulse_us)
-        self.send_command(f"PWMTESTUS {pulse_us}", "設定 PWM400 測試脈寬")
-        self.send_command("PWMTEST ESC ON", "啟用 ESC400 脈波測試模式")
+        self.send_command(f"PWMTESTUS {pulse_us}", "Set ESC400 test pulse width")
+        self.send_command("PWMTEST ESC ON", "Enable ESC400 pulse test")
 
     def enable_raw_tim2_test(self) -> None:
-        self.send_command("PWMTEST RAWTIM2 ON", "啟用 TIM2 CH1 原始 400Hz 方波測試")
+        self.send_command("PWMTEST RAWTIM2 ON", "Enable raw TIM2 CH1 400Hz square-wave test")
 
     def disable_pwm_test(self) -> None:
-        self.send_command("PWMTEST OFF", "停用 PWM400 測試模式")
+        self.send_command("PWMTEST OFF", "Disable PWM test mode")
 
     def enable_pa0_high_test(self) -> None:
-        self.send_command("PINTEST PA0 HIGH", "啟用 PA0 High 腳位身份測試")
+        self.send_command("PINTEST PA0 HIGH", "Set PA0 High")
 
     def enable_pa0_low_test(self) -> None:
-        self.send_command("PINTEST PA0 LOW", "啟用 PA0 Low 腳位身份測試")
+        self.send_command("PINTEST PA0 LOW", "Set PA0 Low")
 
     def enable_pa0_blink_test(self) -> None:
-        self.send_command("PINTEST PA0 BLINK", "啟用 PA0 1Hz 腳位身份測試")
+        self.send_command("PINTEST PA0 BLINK", "Set PA0 1Hz blink test")
 
     def disable_pin_test(self) -> None:
-        self.send_command("PINTEST OFF", "停用 PA0 腳位身份測試")
+        self.send_command("PINTEST OFF", "Disable PA0 pin test")
 
     def on_control_mode_changed(self) -> None:
         mode = self.control_mode_var.get()
         self.update_manual_controls()
         if mode == "manual":
-            self.send_command("MODE MANUAL", "切換手動模式")
+            self.send_command("MODE MANUAL", "Switch to manual mode")
             self.send_manual_throttle_command()
         elif mode == "hover_test":
-            self.send_command("MODE HOVERTEST", "切換懸停穩定測試模式")
+            self.send_command("MODE HOVERTEST", "Switch to hover test mode")
             self.send_hover_throttle_command()
         else:
             self.manual_slider_updating = True
@@ -711,7 +849,7 @@ class TelemetryApp:
                 motor_var.set(0)
             self.manual_slider_updating = False
             self.update_manual_throttle_label()
-            self.send_command("MODE AUTO", "切換自動模式")
+            self.send_command("MODE AUTO", "Switch to auto mode")
 
     def update_manual_controls(self) -> None:
         manual_enabled = (self.control_mode_var.get() == "manual")
@@ -739,11 +877,11 @@ class TelemetryApp:
 
     def send_manual_throttle_command(self) -> None:
         throttle_percent = self.manual_throttle_var.get()
-        self.send_command(f"THROTTLE {throttle_percent}", "設定手動油門")
+        self.send_command(f"THROTTLE {throttle_percent}", "Set manual throttle")
 
     def send_hover_throttle_command(self) -> None:
         throttle_percent = self.hover_throttle_var.get()
-        self.send_command(f"HOVERTHROTTLE {throttle_percent}", "設定懸停測試油門")
+        self.send_command(f"HOVERTHROTTLE {throttle_percent}", "Set hover-test throttle")
 
     def on_manual_throttle_changed(self, _value: str) -> None:
         if self.manual_slider_updating:
@@ -761,7 +899,7 @@ class TelemetryApp:
 
     def send_manual_motor_command(self, motor_index: int) -> None:
         motor_percent = self.manual_motor_vars[motor_index].get()
-        self.send_command(f"MOTOR{motor_index + 1} {motor_percent}", f"設定 M{motor_index + 1} 油門")
+        self.send_command(f"MOTOR{motor_index + 1} {motor_percent}", f"Set M{motor_index + 1} throttle")
 
     def on_manual_motor_changed(self, motor_index: int) -> None:
         if self.manual_slider_updating:
@@ -777,15 +915,15 @@ class TelemetryApp:
 
     def start_csv_logging(self) -> None:
         if self.csv_writer is not None:
-            self.append_log("CSV 記錄已經啟用")
+            self.append_log("CSV logging is already enabled")
             return
 
         default_name = time.strftime("telemetry_%Y%m%d_%H%M%S.csv")
         path = filedialog.asksaveasfilename(
-            title="選擇 CSV 輸出檔案",
+            title="Select CSV output file",
             defaultextension=".csv",
             initialfile=default_name,
-            filetypes=[("CSV 檔案", "*.csv"), ("所有檔案", "*.*")],
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
         )
         if not path:
             return
@@ -795,16 +933,16 @@ class TelemetryApp:
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(["timestamp"] + CSV_FIELD_NAMES)
         self.csv_file.flush()
-        self.csv_path_var.set(str(csv_path))
-        self.append_log(f"開始記錄 CSV: {csv_path}")
+        self._set_text_var(self.csv_path_var, str(csv_path))
+        self.append_log(f"CSV logging started: {csv_path}")
 
     def stop_csv_logging(self) -> None:
         if self.csv_file is not None:
             self.csv_file.close()
         self.csv_file = None
         self.csv_writer = None
-        self.csv_path_var.set("未啟用 CSV 記錄")
-        self.append_log("已停止 CSV 記錄")
+        self._set_text_var(self.csv_path_var, "CSV logging disabled")
+        self.append_log("CSV logging stopped")
 
     def process_queue(self) -> None:
         while True:
@@ -814,14 +952,14 @@ class TelemetryApp:
                 break
 
             if event_type == "status":
-                self.connection_var.set(payload)
+                self._set_text_var(self.connection_var, payload)
                 self.append_log(payload)
             elif event_type == "line":
                 self.handle_line(payload)
             elif event_type == "closed":
-                if self.connection_var.get().startswith("連線中") or self.connection_var.get().startswith("已連線"):
-                    self.connection_var.set(f"{payload} 已斷線")
-                    self.last_update_var.set("等待 IMU/遙測資料")
+                if self.connection_var.get().startswith("Connecting") or self.connection_var.get().startswith("Connected"):
+                    self._set_text_var(self.connection_var, f"{payload} disconnected")
+                    self._set_text_var(self.last_update_var, "Waiting for IMU / telemetry")
 
         self.root.after(50, self.process_queue)
 
@@ -861,7 +999,7 @@ class TelemetryApp:
 
         all_zero = all(abs(value) < 1e-6 for value in values)
         if all_zero:
-            self.last_update_var.set("等待 IMU/遙測資料")
+            self._set_text_var(self.last_update_var, "Waiting for IMU / telemetry")
             return None
 
         return values
@@ -906,6 +1044,7 @@ class TelemetryApp:
         self.csv_file.flush()
 
     def append_log(self, line: str) -> None:
+        line = self._safe_text(line)
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, line + "\n")
         self.log_text.see(tk.END)
@@ -927,14 +1066,30 @@ class TelemetryApp:
         if not hasattr(self, "manual_frame"):
             return
 
-        radio_width = max(self.radio_panel.winfo_width(), 320)
-        compact_radio = radio_width < 620
-        if compact_radio:
-            self.left_stick.grid_configure(row=1, column=0, columnspan=2, padx=0, pady=(0, 6))
-            self.right_stick.grid_configure(row=2, column=0, columnspan=2, padx=0, pady=(0, 6))
+        right_width = max(self.top_controls.winfo_width(), 320)
+        stacked_top_controls = right_width < 860
+        if stacked_top_controls:
+            self.manual_frame.grid_configure(row=0, column=0, padx=0, pady=(0, 5))
+            self.hover_frame.grid_configure(row=1, column=0, padx=0, pady=(0, 5))
+            self.top_controls.columnconfigure(0, weight=1)
+            self.top_controls.columnconfigure(1, weight=0)
         else:
-            self.left_stick.grid_configure(row=1, column=0, columnspan=1, padx=(0, 8), pady=0)
-            self.right_stick.grid_configure(row=1, column=1, columnspan=1, padx=(8, 0), pady=0)
+            self.manual_frame.grid_configure(row=0, column=0, padx=(0, 4), pady=(0, 5))
+            self.hover_frame.grid_configure(row=0, column=1, padx=(4, 0), pady=(0, 5))
+            self.top_controls.columnconfigure(0, weight=1)
+            self.top_controls.columnconfigure(1, weight=1)
+
+        hover_wrap = max(180, min(340, self.hover_frame.winfo_width() - 40))
+        for child in self.hover_frame.winfo_children():
+            if isinstance(child, ttk.Label):
+                try:
+                    child.configure(wraplength=hover_wrap)
+                except tk.TclError:
+                    pass
+
+        self.left_stick.grid_configure(row=1, column=0, columnspan=1, padx=(0, 8), pady=0)
+        self.right_stick.grid_configure(row=1, column=1, columnspan=1, padx=(8, 0), pady=0)
+        self.mixer_frame.grid_configure(row=2, column=0, columnspan=2, pady=(10, 0))
 
         manual_height = max(self.manual_frame.winfo_height(), 180)
         slider_length = max(80, min(160, manual_height - 70))
@@ -946,22 +1101,36 @@ class TelemetryApp:
         hint_wrap = max(160, min(260, self.manual_frame.winfo_width() - 20))
         self.manual_hint_label.configure(wraplength=hint_wrap)
 
+        compact_info = right_width < 860
+        if compact_info:
+            self.motor_pwm_group.grid_configure(row=0, column=0)
+            self.imu_group.grid_configure(row=0, column=1)
+            self.raw_rc_group.grid_configure(row=1, column=0)
+            self.status_stack.grid_configure(row=1, column=1)
+            self.pid_group.grid_configure(row=0, column=0)
+            self.flight_state_group.grid_configure(row=0, column=1)
+        else:
+            self.motor_pwm_group.grid_configure(row=0, column=0)
+            self.imu_group.grid_configure(row=0, column=1)
+            self.raw_rc_group.grid_configure(row=0, column=2)
+            self.status_stack.grid_configure(row=0, column=3)
+            self.pid_group.grid_configure(row=0, column=0)
+            self.flight_state_group.grid_configure(row=1, column=0)
+
     def update_freshness(self) -> None:
         if self.telemetry.last_update_monotonic <= 0.0:
-            self.last_update_var.set("等待 IMU/遙測資料")
+            self._set_text_var(self.last_update_var, "Waiting for IMU / telemetry")
         else:
             age = time.monotonic() - self.telemetry.last_update_monotonic
             if age > 2.0:
-                self.last_update_var.set("等待 IMU/遙測資料")
+                self._set_text_var(self.last_update_var, "Waiting for IMU / telemetry")
             else:
-                self.last_update_var.set(f"資料延遲 {age:.2f}s")
+                self._set_text_var(self.last_update_var, f"Telemetry latency {age:.2f}s")
         self.root.after(500, self.update_freshness)
 
 
 def main() -> None:
     root = tk.Tk()
-    style = ttk.Style(root)
-    style.theme_use("clam")
     app = TelemetryApp(root)
     root.protocol("WM_DELETE_WINDOW", lambda: (app.stop_csv_logging(), app.disconnect(), root.destroy()))
     root.mainloop()
